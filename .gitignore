@@ -10,3 +10,6 @@ wallet.seed
 test_output
 wallet_data
 .idea
+
+.vscode/
+grin-server.log
