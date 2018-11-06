@@ -15,15 +15,17 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use util::RwLock;
 
 use rand::{thread_rng, Rng};
 
-use chrono::prelude::Utc;
+use chrono::prelude::*;
+use chrono::Duration;
 use core::core;
 use core::core::hash::{Hash, Hashed};
+use core::global;
 use core::pow::Difficulty;
-use util::LOGGER;
 
 use peer::Peer;
 use store::{PeerData, PeerStore, State};
@@ -35,13 +37,10 @@ use types::{
 pub struct Peers {
 	pub adapter: Arc<ChainAdapter>,
 	store: PeerStore,
-	peers: RwLock<HashMap<SocketAddr, Arc<RwLock<Peer>>>>,
-	dandelion_relay: RwLock<HashMap<i64, Arc<RwLock<Peer>>>>,
+	peers: RwLock<HashMap<SocketAddr, Arc<Peer>>>,
+	dandelion_relay: RwLock<HashMap<i64, Arc<Peer>>>,
 	config: P2PConfig,
 }
-
-unsafe impl Send for Peers {}
-unsafe impl Sync for Peers {}
 
 impl Peers {
 	pub fn new(store: PeerStore, adapter: Arc<ChainAdapter>, config: P2PConfig) -> Peers {
@@ -56,25 +55,29 @@ impl Peers {
 
 	/// Adds the peer to our internal peer mapping. Note that the peer is still
 	/// returned so the server can run it.
-	pub fn add_connected(&self, p: Peer) -> Result<Arc<RwLock<Peer>>, Error> {
-		debug!(LOGGER, "Saving newly connected peer {}.", p.info.addr);
-		let peer_data = PeerData {
-			addr: p.info.addr,
-			capabilities: p.info.capabilities,
-			user_agent: p.info.user_agent.clone(),
-			flags: State::Healthy,
-			last_banned: 0,
-			ban_reason: ReasonForBan::None,
-		};
+	pub fn add_connected(&self, peer: Arc<Peer>) -> Result<(), Error> {
+		let peer_data: PeerData;
+		let addr: SocketAddr;
+		{
+			peer_data = PeerData {
+				addr: peer.info.addr,
+				capabilities: peer.info.capabilities,
+				user_agent: peer.info.user_agent.clone(),
+				flags: State::Healthy,
+				last_banned: 0,
+				ban_reason: ReasonForBan::None,
+				last_connected: Utc::now().timestamp(),
+			};
+			addr = peer.info.addr.clone();
+		}
+		debug!("Saving newly connected peer {}.", addr);
 		self.save_peer(&peer_data)?;
 
-		let addr = p.info.addr.clone();
-		let apeer = Arc::new(RwLock::new(p));
 		{
-			let mut peers = self.peers.write().unwrap();
-			peers.insert(addr, apeer.clone());
+			let mut peers = self.peers.write();
+			peers.insert(addr, peer.clone());
 		}
-		Ok(apeer)
+		Ok(())
 	}
 
 	// Update the dandelion relay
@@ -85,73 +88,67 @@ impl Peers {
 			Some(peer) => {
 				// Clear the map and add new relay
 				let dandelion_relay = &self.dandelion_relay;
-				dandelion_relay.write().unwrap().clear();
+				dandelion_relay.write().clear();
 				dandelion_relay
 					.write()
-					.unwrap()
 					.insert(Utc::now().timestamp(), peer.clone());
 				debug!(
-					LOGGER,
 					"Successfully updated Dandelion relay to: {}",
-					peer.try_read().unwrap().info.addr
+					peer.info.addr
 				);
 			}
-			None => debug!(LOGGER, "Could not update dandelion relay"),
+			None => debug!("Could not update dandelion relay"),
 		};
 	}
 
 	// Get the dandelion relay
-	pub fn get_dandelion_relay(&self) -> HashMap<i64, Arc<RwLock<Peer>>> {
-		self.dandelion_relay.read().unwrap().clone()
+	pub fn get_dandelion_relay(&self) -> HashMap<i64, Arc<Peer>> {
+		self.dandelion_relay.read().clone()
 	}
 
 	pub fn is_known(&self, addr: &SocketAddr) -> bool {
-		self.peers.read().unwrap().contains_key(addr)
+		self.peers.read().contains_key(addr)
 	}
 
 	/// Get vec of peers we are currently connected to.
-	pub fn connected_peers(&self) -> Vec<Arc<RwLock<Peer>>> {
+	pub fn connected_peers(&self) -> Vec<Arc<Peer>> {
 		let mut res = self
 			.peers
 			.read()
-			.unwrap()
 			.values()
-			.filter(|p| p.read().unwrap().is_connected())
+			.filter(|p| p.is_connected())
 			.cloned()
 			.collect::<Vec<_>>();
 		thread_rng().shuffle(&mut res);
 		res
 	}
 
-	pub fn outgoing_connected_peers(&self) -> Vec<Arc<RwLock<Peer>>> {
+	pub fn outgoing_connected_peers(&self) -> Vec<Arc<Peer>> {
 		let peers = self.connected_peers();
 		let res = peers
 			.into_iter()
-			.filter(|x| match x.try_read() {
-				Ok(peer) => peer.info.direction == Direction::Outbound,
-				Err(_) => false,
-			}).collect::<Vec<_>>();
+			.filter(|x| x.info.direction == Direction::Outbound)
+			.collect::<Vec<_>>();
 		res
 	}
 
 	/// Get a peer we're connected to by address.
-	pub fn get_connected_peer(&self, addr: &SocketAddr) -> Option<Arc<RwLock<Peer>>> {
-		self.peers.read().unwrap().get(addr).map(|p| p.clone())
+	pub fn get_connected_peer(&self, addr: &SocketAddr) -> Option<Arc<Peer>> {
+		self.peers.read().get(addr).map(|p| p.clone())
 	}
 
 	/// Number of peers we're currently connected to.
 	pub fn peer_count(&self) -> u32 {
 		self.peers
 			.read()
-			.unwrap()
 			.values()
-			.filter(|p| p.read().unwrap().is_connected())
+			.filter(|x| x.is_connected())
 			.count() as u32
 	}
 
 	// Return vec of connected peers that currently advertise more work
 	// (total_difficulty) than we do.
-	pub fn more_work_peers(&self) -> Vec<Arc<RwLock<Peer>>> {
+	pub fn more_work_peers(&self) -> Vec<Arc<Peer>> {
 		let peers = self.connected_peers();
 		if peers.len() == 0 {
 			return vec![];
@@ -161,52 +158,21 @@ impl Peers {
 
 		let mut max_peers = peers
 			.into_iter()
-			.filter(|x| match x.try_read() {
-				Ok(peer) => peer.info.total_difficulty > total_difficulty,
-				Err(_) => false,
-			}).collect::<Vec<_>>();
-
-		thread_rng().shuffle(&mut max_peers);
-		max_peers
-	}
-
-	// Return vec of connected peers that currently advertise more work
-	// (total_difficulty) than we do and are also full archival nodes.
-	pub fn more_work_archival_peers(&self) -> Vec<Arc<RwLock<Peer>>> {
-		let peers = self.connected_peers();
-		if peers.len() == 0 {
-			return vec![];
-		}
-
-		let total_difficulty = self.total_difficulty();
-
-		let mut max_peers = peers
-			.into_iter()
-			.filter(|x| match x.try_read() {
-				Ok(peer) => {
-					peer.info.total_difficulty > total_difficulty
-						&& peer.info.capabilities.contains(Capabilities::FULL_HIST)
-				}
-				Err(_) => false,
-			}).collect::<Vec<_>>();
+			.filter(|x| x.info.total_difficulty() > total_difficulty)
+			.collect::<Vec<_>>();
 
 		thread_rng().shuffle(&mut max_peers);
 		max_peers
 	}
 
 	/// Returns single random peer with more work than us.
-	pub fn more_work_peer(&self) -> Option<Arc<RwLock<Peer>>> {
+	pub fn more_work_peer(&self) -> Option<Arc<Peer>> {
 		self.more_work_peers().pop()
-	}
-
-	/// Returns single random archival peer with more work than us.
-	pub fn more_work_archival_peer(&self) -> Option<Arc<RwLock<Peer>>> {
-		self.more_work_archival_peers().pop()
 	}
 
 	/// Return vec of connected peers that currently have the most worked
 	/// branch, showing the highest total difficulty.
-	pub fn most_work_peers(&self) -> Vec<Arc<RwLock<Peer>>> {
+	pub fn most_work_peers(&self) -> Vec<Arc<Peer>> {
 		let peers = self.connected_peers();
 		if peers.len() == 0 {
 			return vec![];
@@ -214,18 +180,14 @@ impl Peers {
 
 		let max_total_difficulty = peers
 			.iter()
-			.map(|x| match x.try_read() {
-				Ok(peer) => peer.info.total_difficulty.clone(),
-				Err(_) => Difficulty::zero(),
-			}).max()
+			.map(|x| x.info.total_difficulty())
+			.max()
 			.unwrap();
 
 		let mut max_peers = peers
 			.into_iter()
-			.filter(|x| match x.try_read() {
-				Ok(peer) => peer.info.total_difficulty == max_total_difficulty,
-				Err(_) => false,
-			}).collect::<Vec<_>>();
+			.filter(|x| x.info.total_difficulty() == max_total_difficulty)
+			.collect::<Vec<_>>();
 
 		thread_rng().shuffle(&mut max_peers);
 		max_peers
@@ -233,7 +195,7 @@ impl Peers {
 
 	/// Returns single random peer with the most worked branch, showing the
 	/// highest total difficulty.
-	pub fn most_work_peer(&self) -> Option<Arc<RwLock<Peer>>> {
+	pub fn most_work_peer(&self) -> Option<Arc<Peer>> {
 		self.most_work_peers().pop()
 	}
 
@@ -249,13 +211,12 @@ impl Peers {
 	/// Ban a peer, disconnecting it if we're currently connected
 	pub fn ban_peer(&self, peer_addr: &SocketAddr, ban_reason: ReasonForBan) {
 		if let Err(e) = self.update_state(*peer_addr, State::Banned) {
-			error!(LOGGER, "Couldn't ban {}: {:?}", peer_addr, e);
+			error!("Couldn't ban {}: {:?}", peer_addr, e);
 		}
 
 		if let Some(peer) = self.get_connected_peer(peer_addr) {
-			debug!(LOGGER, "Banning peer {}", peer_addr);
+			debug!("Banning peer {}", peer_addr);
 			// setting peer status will get it removed at the next clean_peer
-			let peer = peer.write().unwrap();
 			peer.send_ban_reason(ban_reason);
 			peer.set_banned();
 			peer.stop();
@@ -268,45 +229,47 @@ impl Peers {
 			Ok(_) => {
 				if self.is_banned(*peer_addr) {
 					if let Err(e) = self.update_state(*peer_addr, State::Healthy) {
-						error!(LOGGER, "Couldn't unban {}: {:?}", peer_addr, e);
+						error!("Couldn't unban {}: {:?}", peer_addr, e);
 					}
 				} else {
-					error!(LOGGER, "Couldn't unban {}: peer is not banned", peer_addr);
+					error!("Couldn't unban {}: peer is not banned", peer_addr);
 				}
 			}
-			Err(e) => error!(LOGGER, "Couldn't unban {}: {:?}", peer_addr, e),
+			Err(e) => error!("Couldn't unban {}: {:?}", peer_addr, e),
 		};
 	}
 
-	fn broadcast<F>(&self, obj_name: &str, f: F) -> u8
+	fn broadcast<F>(&self, obj_name: &str, num_peers: u32, inner: F) -> u32
 	where
-		F: Fn(&Peer) -> Result<(), Error>,
+		F: Fn(&Peer) -> Result<bool, Error>,
 	{
-		let peers = self.connected_peers();
-		let preferred_peers = 8;
 		let mut count = 0;
-		for p in peers.iter().take(preferred_peers) {
-			let p = p.read().unwrap();
-			if p.is_connected() {
-				if let Err(e) = f(&p) {
-					debug!(LOGGER, "Error sending {} to peer: {:?}", obj_name, e);
-				} else {
-					count += 1;
-				}
+
+		// Iterate over our connected peers.
+		// Try our best to send to at most num_peers peers.
+		for p in self.connected_peers().iter() {
+			match inner(&p) {
+				Ok(true) => count += 1,
+				Ok(false) => (),
+				Err(e) => debug!("Error sending {} to peer: {:?}", obj_name, e),
+			}
+
+			if count >= num_peers {
+				break;
 			}
 		}
 		count
 	}
 
-	/// Broadcasts the provided compact block to PEER_PREFERRED_COUNT of our peers.
-	/// We may be connected to PEER_MAX_COUNT peers so we only
-	/// want to broadcast to a random subset of peers.
+	/// Broadcasts the provided compact block to PEER_MAX_COUNT of our peers.
+	/// This is only used when initially broadcasting a newly mined block
+	/// from a mining node so we want to broadcast it far and wide.
 	/// A peer implementation may drop the broadcast request
 	/// if it knows the remote peer already has the block.
 	pub fn broadcast_compact_block(&self, b: &core::CompactBlock) {
-		let count = self.broadcast("compact block", |p| p.send_compact_block(b));
+		let num_peers = self.config.peer_max_count();
+		let count = self.broadcast("compact block", num_peers, |p| p.send_compact_block(b));
 		debug!(
-			LOGGER,
 			"broadcast_compact_block: {}, {} at {}, to {} peers, done.",
 			b.hash(),
 			b.header.pow.total_difficulty,
@@ -321,9 +284,9 @@ impl Peers {
 	/// A peer implementation may drop the broadcast request
 	/// if it knows the remote peer already has the header.
 	pub fn broadcast_header(&self, bh: &core::BlockHeader) {
-		let count = self.broadcast("header", |p| p.send_header(bh));
-		trace!(
-			LOGGER,
+		let num_peers = self.config.peer_min_preferred_count();
+		let count = self.broadcast("header", num_peers, |p| p.send_header(bh));
+		debug!(
 			"broadcast_header: {}, {} at {}, to {} peers, done.",
 			bh.hash(),
 			bh.pow.total_difficulty,
@@ -336,7 +299,7 @@ impl Peers {
 	pub fn broadcast_stem_transaction(&self, tx: &core::Transaction) -> Result<(), Error> {
 		let dandelion_relay = self.get_dandelion_relay();
 		if dandelion_relay.is_empty() {
-			debug!(LOGGER, "No dandelion relay, updating.");
+			debug!("No dandelion relay, updating.");
 			self.update_dandelion_relay();
 		}
 		// If still return an error, let the caller handle this as they see fit.
@@ -345,13 +308,9 @@ impl Peers {
 			return Err(Error::NoDandelionRelay);
 		}
 		for relay in dandelion_relay.values() {
-			let relay = relay.read().unwrap();
 			if relay.is_connected() {
 				if let Err(e) = relay.send_stem_transaction(tx) {
-					debug!(
-						LOGGER,
-						"Error sending stem transaction to peer relay: {:?}", e
-					);
+					debug!("Error sending stem transaction to peer relay: {:?}", e);
 				}
 			}
 		}
@@ -364,9 +323,9 @@ impl Peers {
 	/// A peer implementation may drop the broadcast request
 	/// if it knows the remote peer already has the transaction.
 	pub fn broadcast_transaction(&self, tx: &core::Transaction) {
-		let count = self.broadcast("transaction", |p| p.send_transaction(tx));
+		let num_peers = self.config.peer_min_preferred_count();
+		let count = self.broadcast("transaction", num_peers, |p| p.send_transaction(tx));
 		trace!(
-			LOGGER,
 			"broadcast_transaction: {}, to {} peers, done.",
 			tx.hash(),
 			count,
@@ -376,9 +335,8 @@ impl Peers {
 	/// Ping all our connected peers. Always automatically expects a pong back
 	/// or disconnects. This acts as a liveness test.
 	pub fn check_all(&self, total_difficulty: Difficulty, height: u64) {
-		let peers_map = self.peers.read().unwrap();
+		let peers_map = self.peers.read();
 		for p in peers_map.values() {
-			let p = p.read().unwrap();
 			if p.is_connected() {
 				let _ = p.send_ping(total_difficulty, height);
 			}
@@ -424,28 +382,28 @@ impl Peers {
 		let mut rm = vec![];
 
 		// build a list of peers to be cleaned up
-		for peer in self.peers.read().unwrap().values() {
-			let peer_inner = peer.read().unwrap();
-			if peer_inner.is_banned() {
-				debug!(
-					LOGGER,
-					"clean_peers {:?}, peer banned", peer_inner.info.addr
-				);
+		for peer in self.peers.read().values() {
+			if peer.is_banned() {
+				debug!("clean_peers {:?}, peer banned", peer.info.addr);
 				rm.push(peer.clone());
-			} else if !peer_inner.is_connected() {
-				debug!(
-					LOGGER,
-					"clean_peers {:?}, not connected", peer_inner.info.addr
-				);
+			} else if !peer.is_connected() {
+				debug!("clean_peers {:?}, not connected", peer.info.addr);
 				rm.push(peer.clone());
+			} else {
+				let (stuck, diff) = peer.is_stuck();
+				if stuck && diff < self.adapter.total_difficulty() {
+					debug!("clean_peers {:?}, stuck peer", peer.info.addr);
+					peer.stop();
+					let _ = self.update_state(peer.info.addr, State::Defunct);
+					rm.push(peer.clone());
+				}
 			}
 		}
 
 		// now clean up peer map based on the list to remove
 		{
-			let mut peers = self.peers.write().unwrap();
+			let mut peers = self.peers.write();
 			for p in rm {
-				let p = p.read().unwrap();
 				peers.remove(&p.info.addr);
 			}
 		}
@@ -461,33 +419,54 @@ impl Peers {
 		};
 
 		// map peers to addrs in a block to bound how long we keep the read lock for
-		let addrs = {
-			self.connected_peers()
-				.iter()
-				.map(|x| {
-					let p = x.read().unwrap();
-					p.info.addr.clone()
-				}).collect::<Vec<_>>()
-		};
+		let addrs = self
+			.connected_peers()
+			.iter()
+			.map(|x| x.info.addr.clone())
+			.collect::<Vec<_>>();
 
 		// now remove them taking a short-lived write lock each time
 		// maybe better to take write lock once and remove them all?
 		for x in addrs.iter().take(excess_count) {
-			let mut peers = self.peers.write().unwrap();
+			let mut peers = self.peers.write();
 			peers.remove(x);
 		}
 	}
 
 	pub fn stop(&self) {
-		let mut peers = self.peers.write().unwrap();
+		let mut peers = self.peers.write();
 		for (_, peer) in peers.drain() {
-			let peer = peer.read().unwrap();
 			peer.stop();
 		}
 	}
 
 	pub fn enough_peers(&self) -> bool {
 		self.connected_peers().len() >= self.config.peer_min_preferred_count() as usize
+	}
+
+	/// Removes those peers that seem to have expired
+	pub fn remove_expired(&self) {
+		let now = Utc::now();
+
+		// Delete defunct peers from storage
+		let _ = self.store.delete_peers(|peer| {
+			let diff = now - Utc.timestamp(peer.last_connected, 0);
+
+			let should_remove = peer.flags == State::Defunct
+				&& diff > Duration::seconds(global::PEER_EXPIRATION_REMOVE_TIME);
+
+			if should_remove {
+				debug!(
+					"removing peer {:?}: last connected {} days {} hours {} minutes ago.",
+					peer.addr,
+					diff.num_days(),
+					diff.num_hours(),
+					diff.num_minutes()
+				);
+			}
+
+			should_remove
+		});
 	}
 }
 
@@ -510,8 +489,8 @@ impl ChainAdapter for Peers {
 			// if the peer sent us a block that's intrinsically bad
 			// they are either mistaken or malevolent, both of which require a ban
 			debug!(
-				LOGGER,
-				"Received a bad block {} from  {}, the peer will be banned", hash, peer_addr
+				"Received a bad block {} from  {}, the peer will be banned",
+				hash, peer_addr
 			);
 			self.ban_peer(&peer_addr, ReasonForBan::BadBlock);
 			false
@@ -526,10 +505,8 @@ impl ChainAdapter for Peers {
 			// if the peer sent us a block that's intrinsically bad
 			// they are either mistaken or malevolent, both of which require a ban
 			debug!(
-				LOGGER,
 				"Received a bad compact block {} from  {}, the peer will be banned",
-				hash,
-				&peer_addr
+				hash, &peer_addr
 			);
 			self.ban_peer(&peer_addr, ReasonForBan::BadCompactBlock);
 			false
@@ -579,14 +556,24 @@ impl ChainAdapter for Peers {
 	fn txhashset_write(&self, h: Hash, txhashset_data: File, peer_addr: SocketAddr) -> bool {
 		if !self.adapter.txhashset_write(h, txhashset_data, peer_addr) {
 			debug!(
-				LOGGER,
-				"Received a bad txhashset data from {}, the peer will be banned", &peer_addr
+				"Received a bad txhashset data from {}, the peer will be banned",
+				&peer_addr
 			);
 			self.ban_peer(&peer_addr, ReasonForBan::BadTxHashSet);
 			false
 		} else {
 			true
 		}
+	}
+
+	fn txhashset_download_update(
+		&self,
+		start_time: DateTime<Utc>,
+		downloaded_size: u64,
+		total_size: u64,
+	) -> bool {
+		self.adapter
+			.txhashset_download_update(start_time, downloaded_size, total_size)
 	}
 }
 
@@ -595,17 +582,13 @@ impl NetAdapter for Peers {
 	/// addresses.
 	fn find_peer_addrs(&self, capab: Capabilities) -> Vec<SocketAddr> {
 		let peers = self.find_peers(State::Healthy, capab, MAX_PEER_ADDRS as usize);
-		trace!(
-			LOGGER,
-			"find_peer_addrs: {} healthy peers picked",
-			peers.len()
-		);
+		trace!("find_peer_addrs: {} healthy peers picked", peers.len());
 		map_vec!(peers, |p| p.addr)
 	}
 
 	/// A list of peers has been received from one of our peers.
 	fn peer_addrs_received(&self, peer_addrs: Vec<SocketAddr>) {
-		trace!(LOGGER, "Received {} peer addrs, saving.", peer_addrs.len());
+		trace!("Received {} peer addrs, saving.", peer_addrs.len());
 		for pa in peer_addrs {
 			if let Ok(e) = self.exists_peer(pa) {
 				if e {
@@ -619,38 +602,22 @@ impl NetAdapter for Peers {
 				flags: State::Healthy,
 				last_banned: 0,
 				ban_reason: ReasonForBan::None,
+				last_connected: Utc::now().timestamp(),
 			};
 			if let Err(e) = self.save_peer(&peer) {
-				error!(LOGGER, "Could not save received peer address: {:?}", e);
+				error!("Could not save received peer address: {:?}", e);
 			}
 		}
 	}
 
 	fn peer_difficulty(&self, addr: SocketAddr, diff: Difficulty, height: u64) {
-		if diff != self.total_difficulty() || height != self.total_height() {
-			trace!(
-				LOGGER,
-				"ping/pong: {}: {} @ {} vs us: {} @ {}",
-				addr,
-				diff,
-				height,
-				self.total_difficulty(),
-				self.total_height()
-			);
-		}
-
-		if diff.to_num() > 0 {
-			if let Some(peer) = self.get_connected_peer(&addr) {
-				let mut peer = peer.write().unwrap();
-				peer.info.total_difficulty = diff;
-				peer.info.height = height;
-			}
+		if let Some(peer) = self.get_connected_peer(&addr) {
+			peer.info.update(height, diff);
 		}
 	}
 
 	fn is_banned(&self, addr: SocketAddr) -> bool {
 		if let Some(peer) = self.get_connected_peer(&addr) {
-			let peer = peer.write().unwrap();
 			peer.is_banned()
 		} else {
 			false

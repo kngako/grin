@@ -27,7 +27,7 @@ use pow::{Difficulty, Proof, ProofOfWork};
 pub fn genesis_dev() -> core::Block {
 	core::Block::with_header(core::BlockHeader {
 		height: 0,
-		previous: core::hash::Hash([0xff; 32]),
+		// previous: core::hash::Hash([0xff; 32]),
 		timestamp: Utc.ymd(1997, 8, 4).and_hms(0, 0, 0),
 		pow: ProofOfWork {
 			nonce: global::get_genesis_nonce(),
@@ -44,8 +44,8 @@ pub fn genesis_testnet1() -> core::Block {
 		height: 0,
 		timestamp: Utc.ymd(2017, 11, 16).and_hms(20, 0, 0),
 		pow: ProofOfWork {
-			total_difficulty: Difficulty::one(),
-			scaling_difficulty: 1,
+			total_difficulty: Difficulty::min(),
+			secondary_scaling: 1,
 			nonce: 28205,
 			proof: Proof::new(vec![
 				0x21e, 0x7a2, 0xeae, 0x144e, 0x1b1c, 0x1fbd, 0x203a, 0x214b, 0x293b, 0x2b74,
@@ -63,11 +63,11 @@ pub fn genesis_testnet1() -> core::Block {
 pub fn genesis_testnet2() -> core::Block {
 	core::Block::with_header(core::BlockHeader {
 		height: 0,
-		previous: core::hash::Hash([0xff; 32]),
+		// previous: core::hash::Hash([0xff; 32]),
 		timestamp: Utc.ymd(2018, 3, 26).and_hms(16, 0, 0),
 		pow: ProofOfWork {
 			total_difficulty: Difficulty::from_num(global::initial_block_difficulty()),
-			scaling_difficulty: 1,
+			secondary_scaling: 1,
 			nonce: 1060,
 			proof: Proof::new(vec![
 				0x1940730, 0x333b9d0, 0x4739d6f, 0x4c6cfb1, 0x6e3d6c3, 0x74408a3, 0x7ba2bd2,
@@ -86,11 +86,11 @@ pub fn genesis_testnet2() -> core::Block {
 pub fn genesis_testnet3() -> core::Block {
 	core::Block::with_header(core::BlockHeader {
 		height: 0,
-		previous: core::hash::Hash([0xff; 32]),
+		// previous: core::hash::Hash([0xff; 32]),
 		timestamp: Utc.ymd(2018, 7, 8).and_hms(18, 0, 0),
 		pow: ProofOfWork {
 			total_difficulty: Difficulty::from_num(global::initial_block_difficulty()),
-			scaling_difficulty: 1,
+			secondary_scaling: 1,
 			nonce: 4956988373127691,
 			proof: Proof::new(vec![
 				0xa420dc, 0xc8ffee, 0x10e433e, 0x1de9428, 0x2ed4cea, 0x52d907b, 0x5af0e3f,
@@ -105,16 +105,39 @@ pub fn genesis_testnet3() -> core::Block {
 	})
 }
 
+/// 4th testnet genesis block (cuckatoo29 AR, 30+ AF). Temporary values for now (Pow won't verify)
+/// NB: Currently set to intenal pre-testnet values
+pub fn genesis_testnet4() -> core::Block {
+	core::Block::with_header(core::BlockHeader {
+		height: 0,
+		// previous: core::hash::Hash([0xff; 32]),
+		timestamp: Utc.ymd(2018, 10, 17).and_hms(20, 0, 0),
+		pow: ProofOfWork {
+			total_difficulty: Difficulty::from_num(global::initial_block_difficulty()),
+			secondary_scaling: global::initial_graph_weight(),
+			nonce: 8612241555342799290,
+			proof: Proof::new(vec![
+				0x46f3b4, 0x1135f8c, 0x1a1596f, 0x1e10f71, 0x41c03ea, 0x63fe8e7, 0x65af34f,
+				0x73c16d3, 0x8216dc3, 0x9bc75d0, 0xae7d9ad, 0xc1cb12b, 0xc65e957, 0xf67a152,
+				0xfac6559, 0x100c3d71, 0x11eea08b, 0x1225dfbb, 0x124d61a1, 0x132a14b4, 0x13f4ec38,
+				0x1542d236, 0x155f2df0, 0x1577394e, 0x163c3513, 0x19349845, 0x19d46953, 0x19f65ed4,
+				0x1a0411b9, 0x1a2fa039, 0x1a72a06c, 0x1b02ddd2, 0x1b594d59, 0x1b7bffd3, 0x1befe12e,
+				0x1c82e4cd, 0x1d492478, 0x1de132a5, 0x1e578b3c, 0x1ed96855, 0x1f222896, 0x1fea0da6,
+			]),
+		},
+		..Default::default()
+	})
+}
 /// Placeholder for mainnet genesis block, will definitely change before
 /// release so no use trying to pre-mine it.
 pub fn genesis_main() -> core::Block {
 	core::Block::with_header(core::BlockHeader {
 		height: 0,
-		previous: core::hash::Hash([0xff; 32]),
+		// previous: core::hash::Hash([0xff; 32]),
 		timestamp: Utc.ymd(2018, 8, 14).and_hms(0, 0, 0),
 		pow: ProofOfWork {
 			total_difficulty: Difficulty::from_num(global::initial_block_difficulty()),
-			scaling_difficulty: 1,
+			secondary_scaling: 1,
 			nonce: global::get_genesis_nonce(),
 			proof: Proof::zero(consensus::PROOFSIZE),
 		},

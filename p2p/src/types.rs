@@ -17,6 +17,10 @@ use std::fs::File;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::mpsc;
+use std::sync::Arc;
+use util::RwLock;
+
+use chrono::prelude::*;
 
 use core::core::hash::Hash;
 use core::pow::Difficulty;
@@ -189,23 +193,27 @@ impl Default for Seeding {
 }
 
 bitflags! {
-  /// Options for what type of interaction a peer supports
-  #[derive(Serialize, Deserialize)]
-  pub struct Capabilities: u32 {
-	/// We don't know (yet) what the peer can do.
-	const UNKNOWN = 0b00000000;
-	/// Full archival node, has the whole history without any pruning.
-	const FULL_HIST = 0b00000001;
-	/// Can provide block headers and the TxHashSet for some recent-enough
-	/// height.
-	const TXHASHSET_HIST = 0b00000010;
-	/// Can provide a list of healthy peers
-	const PEER_LIST = 0b00000100;
+	/// Options for what type of interaction a peer supports
+	#[derive(Serialize, Deserialize)]
+	pub struct Capabilities: u32 {
+		/// We don't know (yet) what the peer can do.
+		const UNKNOWN = 0b00000000;
+		/// Can provide full history of headers back to genesis
+		/// (for at least one arbitrary fork).
+		const HEADER_HIST = 0b00000001;
+		/// Can provide block headers and the TxHashSet for some recent-enough
+		/// height.
+		const TXHASHSET_HIST = 0b00000010;
+		/// Can provide a list of healthy peers
+		const PEER_LIST = 0b00000100;
 
-	const FULL_NODE = Capabilities::FULL_HIST.bits
-		| Capabilities::TXHASHSET_HIST.bits
-		| Capabilities::PEER_LIST.bits;
-  }
+		/// All nodes right now are "full nodes".
+		/// Some nodes internally may maintain longer block histories (archival_mode)
+		/// but we do not advertise this to other nodes.
+		const FULL_NODE = Capabilities::HEADER_HIST.bits
+			| Capabilities::TXHASHSET_HIST.bits
+			| Capabilities::PEER_LIST.bits;
+	}
 }
 
 /// Types of connection
@@ -230,16 +238,79 @@ enum_from_primitive! {
 	}
 }
 
+#[derive(Clone, Debug)]
+pub struct PeerLiveInfo {
+	pub total_difficulty: Difficulty,
+	pub height: u64,
+	pub last_seen: DateTime<Utc>,
+	pub stuck_detector: DateTime<Utc>,
+}
+
 /// General information about a connected peer that's useful to other modules.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct PeerInfo {
 	pub capabilities: Capabilities,
 	pub user_agent: String,
 	pub version: u32,
 	pub addr: SocketAddr,
+	pub direction: Direction,
+	pub live_info: Arc<RwLock<PeerLiveInfo>>,
+}
+
+impl PeerInfo {
+	/// The current total_difficulty of the peer.
+	pub fn total_difficulty(&self) -> Difficulty {
+		self.live_info.read().total_difficulty
+	}
+
+	/// The current height of the peer.
+	pub fn height(&self) -> u64 {
+		self.live_info.read().height
+	}
+
+	/// Time of last_seen for this peer (via ping/pong).
+	pub fn last_seen(&self) -> DateTime<Utc> {
+		self.live_info.read().last_seen
+	}
+
+	/// Update the total_difficulty, height and last_seen of the peer.
+	/// Takes a write lock on the live_info.
+	pub fn update(&self, height: u64, total_difficulty: Difficulty) {
+		let mut live_info = self.live_info.write();
+		if total_difficulty != live_info.total_difficulty {
+			live_info.stuck_detector = Utc::now();
+		}
+		live_info.height = height;
+		live_info.total_difficulty = total_difficulty;
+		live_info.last_seen = Utc::now()
+	}
+}
+
+/// Flatten out a PeerInfo and nested PeerLiveInfo (taking a read lock on it)
+/// so we can serialize/deserialize the data for the API and the TUI.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PeerInfoDisplay {
+	pub capabilities: Capabilities,
+	pub user_agent: String,
+	pub version: u32,
+	pub addr: SocketAddr,
+	pub direction: Direction,
 	pub total_difficulty: Difficulty,
 	pub height: u64,
-	pub direction: Direction,
+}
+
+impl From<PeerInfo> for PeerInfoDisplay {
+	fn from(info: PeerInfo) -> PeerInfoDisplay {
+		PeerInfoDisplay {
+			capabilities: info.capabilities.clone(),
+			user_agent: info.user_agent.clone(),
+			version: info.version.clone(),
+			addr: info.addr.clone(),
+			direction: info.direction.clone(),
+			total_difficulty: info.total_difficulty(),
+			height: info.height(),
+		}
+	}
 }
 
 /// The full txhashset data along with indexes required for a consumer to
@@ -299,6 +370,14 @@ pub trait ChainAdapter: Sync + Send {
 	/// attack attempt. This should be checked *before* downloading the whole
 	/// state data.
 	fn txhashset_receive_ready(&self) -> bool;
+
+	/// Update txhashset downloading progress
+	fn txhashset_download_update(
+		&self,
+		start_time: DateTime<Utc>,
+		downloaded_size: u64,
+		total_size: u64,
+	) -> bool;
 
 	/// Writes a reading view on a txhashset state that's been provided to us.
 	/// If we're willing to accept that new state, the data stream will be

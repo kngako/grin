@@ -26,28 +26,30 @@ extern crate grin_wallet as wallet;
 extern crate chrono;
 extern crate rand;
 
+use std::collections::HashSet;
 use std::fs;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use util::RwLock;
 
-use core::core::hash::Hash;
+use core::core::hash::{Hash, Hashed};
 use core::core::verifier_cache::VerifierCache;
-use core::core::{BlockHeader, Transaction};
+use core::core::{Block, BlockHeader, BlockSums, Committed, Transaction};
 
 use chain::store::ChainStore;
-use chain::txhashset;
-use chain::txhashset::TxHashSet;
+use chain::types::Tip;
 use pool::*;
 
-use keychain::Keychain;
+use keychain::{ExtKeychain, Keychain};
 use wallet::libtx;
 
 use pool::types::*;
 use pool::TransactionPool;
+use util::secp::pedersen::Commitment;
 
 #[derive(Clone)]
 pub struct ChainAdapter {
-	pub txhashset: Arc<RwLock<TxHashSet>>,
 	pub store: Arc<ChainStore>,
+	pub utxo: Arc<RwLock<HashSet<Commitment>>>,
 }
 
 impl ChainAdapter {
@@ -57,13 +59,55 @@ impl ChainAdapter {
 		let chain_store =
 			ChainStore::new(db_env).map_err(|e| format!("failed to init chain_store, {:?}", e))?;
 		let store = Arc::new(chain_store);
-		let txhashset = TxHashSet::open(target_dir.clone(), store.clone(), None)
-			.map_err(|e| format!("failed to init txhashset, {}", e))?;
+		let utxo = Arc::new(RwLock::new(HashSet::new()));
 
-		Ok(ChainAdapter {
-			txhashset: Arc::new(RwLock::new(txhashset)),
-			store: store.clone(),
-		})
+		Ok(ChainAdapter { store, utxo })
+	}
+
+	pub fn update_db_for_block(&self, block: &Block) {
+		let header = &block.header;
+		let tip = Tip::from_header(header);
+		let batch = self.store.batch().unwrap();
+
+		batch.save_block_header(header).unwrap();
+		batch.save_head(&tip).unwrap();
+
+		// Retrieve previous block_sums from the db.
+		let prev_sums = if let Ok(prev_sums) = batch.get_block_sums(&tip.prev_block_h) {
+			prev_sums
+		} else {
+			BlockSums::default()
+		};
+
+		// Overage is based purely on the new block.
+		// Previous block_sums have taken all previous overage into account.
+		let overage = header.overage();
+
+		// Offset on the other hand is the total kernel offset from the new block.
+		let offset = header.total_kernel_offset();
+
+		// Verify the kernel sums for the block_sums with the new block applied.
+		let (utxo_sum, kernel_sum) = (prev_sums, block as &Committed)
+			.verify_kernel_sums(overage, offset)
+			.unwrap();
+
+		let block_sums = BlockSums {
+			utxo_sum,
+			kernel_sum,
+		};
+		batch.save_block_sums(&header.hash(), &block_sums).unwrap();
+
+		batch.commit().unwrap();
+
+		{
+			let mut utxo = self.utxo.write();
+			for x in block.inputs() {
+				utxo.remove(&x.commitment());
+			}
+			for x in block.outputs() {
+				utxo.insert(x.commitment());
+			}
+		}
 	}
 }
 
@@ -74,24 +118,34 @@ impl BlockChain for ChainAdapter {
 			.map_err(|_| PoolError::Other(format!("failed to get chain head")))
 	}
 
-	fn validate_raw_txs(
-		&self,
-		txs: Vec<Transaction>,
-		pre_tx: Option<Transaction>,
-		block_hash: &Hash,
-	) -> Result<Vec<Transaction>, PoolError> {
-		let header = self
-			.store
-			.get_block_header(&block_hash)
-			.map_err(|_| PoolError::Other(format!("failed to get header")))?;
+	fn get_block_header(&self, hash: &Hash) -> Result<BlockHeader, PoolError> {
+		self.store
+			.get_block_header(hash)
+			.map_err(|_| PoolError::Other(format!("failed to get block header")))
+	}
 
-		let mut txhashset = self.txhashset.write().unwrap();
-		let res = txhashset::extending_readonly(&mut txhashset, |extension| {
-			extension.rewind(&header)?;
-			let valid_txs = extension.validate_raw_txs(txs, pre_tx)?;
-			Ok(valid_txs)
-		}).map_err(|e| PoolError::Other(format!("Error: test chain adapter: {:?}", e)))?;
-		Ok(res)
+	fn get_block_sums(&self, hash: &Hash) -> Result<BlockSums, PoolError> {
+		self.store
+			.get_block_sums(hash)
+			.map_err(|_| PoolError::Other(format!("failed to get block sums")))
+	}
+
+	fn validate_tx(&self, tx: &Transaction) -> Result<(), pool::PoolError> {
+		let utxo = self.utxo.read();
+
+		for x in tx.outputs() {
+			if utxo.contains(&x.commitment()) {
+				return Err(PoolError::Other(format!("output commitment not unique")));
+			}
+		}
+
+		for x in tx.inputs() {
+			if !utxo.contains(&x.commitment()) {
+				return Err(PoolError::Other(format!("not in utxo set")));
+			}
+		}
+
+		Ok(())
 	}
 
 	// Mocking this check out for these tests.
@@ -114,6 +168,7 @@ pub fn test_setup(
 		PoolConfig {
 			accept_fee_base: 0,
 			max_pool_size: 50,
+			max_stempool_size: 50,
 		},
 		chain.clone(),
 		verifier_cache.clone(),
@@ -140,12 +195,12 @@ where
 
 	// single input spending a single coinbase (deterministic key_id aka height)
 	{
-		let key_id = keychain.derive_key_id(header.height as u32).unwrap();
+		let key_id = ExtKeychain::derive_key_id(1, header.height as u32, 0, 0, 0);
 		tx_elements.push(libtx::build::coinbase_input(coinbase_reward, key_id));
 	}
 
 	for output_value in output_values {
-		let key_id = keychain.derive_key_id(output_value as u32).unwrap();
+		let key_id = ExtKeychain::derive_key_id(1, output_value as u32, 0, 0, 0);
 		tx_elements.push(libtx::build::output(output_value, key_id));
 	}
 
@@ -171,12 +226,12 @@ where
 	let mut tx_elements = Vec::new();
 
 	for input_value in input_values {
-		let key_id = keychain.derive_key_id(input_value as u32).unwrap();
+		let key_id = ExtKeychain::derive_key_id(1, input_value as u32, 0, 0, 0);
 		tx_elements.push(libtx::build::input(input_value, key_id));
 	}
 
 	for output_value in output_values {
-		let key_id = keychain.derive_key_id(output_value as u32).unwrap();
+		let key_id = ExtKeychain::derive_key_id(1, output_value as u32, 0, 0, 0);
 		tx_elements.push(libtx::build::output(output_value, key_id));
 	}
 	tx_elements.push(libtx::build::with_fee(fees as u64));

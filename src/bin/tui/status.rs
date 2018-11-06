@@ -14,6 +14,7 @@
 
 //! Basic status view definition
 
+use chrono::prelude::Utc;
 use cursive::direction::Orientation;
 use cursive::traits::Identifiable;
 use cursive::view::View;
@@ -26,6 +27,8 @@ use tui::types::TUIStatusListener;
 use servers::common::types::SyncStatus;
 use servers::ServerStats;
 
+const NANO_TO_MILLIS: f64 = 1.0 / 1_000_000.0;
+
 pub struct TUIStatusView;
 
 impl TUIStatusListener for TUIStatusView {
@@ -37,35 +40,42 @@ impl TUIStatusListener for TUIStatusView {
 					LinearLayout::new(Orientation::Horizontal)
 						.child(TextView::new("Current Status: "))
 						.child(TextView::new("Starting").with_id("basic_current_status")),
-				)
-				.child(
+				).child(
 					LinearLayout::new(Orientation::Horizontal)
 						.child(TextView::new("Connected Peers: "))
 						.child(TextView::new("0").with_id("connected_peers")),
-				)
-				.child(
+				).child(
+					LinearLayout::new(Orientation::Horizontal)
+						.child(TextView::new("------------------------")),
+				).child(
+					LinearLayout::new(Orientation::Horizontal)
+						.child(TextView::new("Header Chain Height: "))
+						.child(TextView::new("  ").with_id("basic_header_chain_height")),
+				).child(
+					LinearLayout::new(Orientation::Horizontal)
+						.child(TextView::new("Header Cumulative Difficulty: "))
+						.child(TextView::new("  ").with_id("basic_header_total_difficulty")),
+				).child(
+					LinearLayout::new(Orientation::Horizontal)
+						.child(TextView::new("------------------------")),
+				).child(
 					LinearLayout::new(Orientation::Horizontal)
 						.child(TextView::new("Chain Height: "))
 						.child(TextView::new("  ").with_id("chain_height")),
-				)
-				.child(
+				).child(
 					LinearLayout::new(Orientation::Horizontal)
-						.child(TextView::new("Total Difficulty: "))
+						.child(TextView::new("Cumulative Difficulty: "))
 						.child(TextView::new("  ").with_id("basic_total_difficulty")),
-				)
-				.child(
+				).child(
 					LinearLayout::new(Orientation::Horizontal)
 						.child(TextView::new("------------------------")),
-				)
-				.child(
+				).child(
 					LinearLayout::new(Orientation::Horizontal)
 						.child(TextView::new("  ").with_id("basic_mining_config_status")),
-				)
-				.child(
+				).child(
 					LinearLayout::new(Orientation::Horizontal)
 						.child(TextView::new("  ").with_id("basic_mining_status")),
-				)
-				.child(
+				).child(
 					LinearLayout::new(Orientation::Horizontal)
 						.child(TextView::new("  ").with_id("basic_network_info")),
 				), //.child(logo_view)
@@ -77,63 +87,87 @@ impl TUIStatusListener for TUIStatusView {
 	fn update(c: &mut Cursive, stats: &ServerStats) {
 		//find and update here as needed
 		let basic_status = {
-			if stats.awaiting_peers {
-				"Waiting for peers".to_string()
-			} else {
-				match stats.sync_status {
-					SyncStatus::Initial => "Initializing".to_string(),
-					SyncStatus::NoSync => "Running".to_string(),
-					SyncStatus::HeaderSync {
-						current_height,
-						highest_height,
-					} => {
-						let percent = if highest_height == 0 {
-							0
-						} else {
-							current_height * 100 / highest_height
-						};
-						format!("Downloading headers: {}%, step 1/4", percent)
-					}
-					SyncStatus::TxHashsetDownload => {
-						"Downloading chain state for fast sync, step 2/4".to_string()
-					}
-					SyncStatus::TxHashsetSetup => {
-						"Preparing chain state for validation, step 3/4".to_string()
-					}
-					SyncStatus::TxHashsetValidation {
-						kernels,
-						kernel_total,
-						rproofs,
-						rproof_total,
-					} => {
-						// 10% of overall progress is attributed to kernel validation
-						// 90% to range proofs (which are much longer)
-						let mut percent = if kernel_total > 0 {
-							kernels * 10 / kernel_total
+			match stats.sync_status {
+				SyncStatus::Initial => "Initializing".to_string(),
+				SyncStatus::NoSync => "Running".to_string(),
+				SyncStatus::AwaitingPeers(_) => "Waiting for peers".to_string(),
+				SyncStatus::HeaderSync {
+					current_height,
+					highest_height,
+				} => {
+					let percent = if highest_height == 0 {
+						0
+					} else {
+						current_height * 100 / highest_height
+					};
+					format!("Downloading headers: {}%, step 1/4", percent)
+				}
+				SyncStatus::TxHashsetDownload {
+					start_time,
+					downloaded_size,
+					total_size,
+				} => {
+					if total_size > 0 {
+						let percent = if total_size > 0 {
+							downloaded_size * 100 / total_size
 						} else {
 							0
 						};
-						percent += if rproof_total > 0 {
-							rproofs * 90 / rproof_total
-						} else {
-							0
-						};
-						format!("Validating chain state: {}%, step 3/4", percent)
+						let start = start_time.timestamp_nanos();
+						let fin = Utc::now().timestamp_nanos();
+						let dur_ms = (fin - start) as f64 * NANO_TO_MILLIS;
+
+						format!("Downloading {}(MB) chain state for fast sync: {}% at {:.1?}(kB/s), step 2/4",
+						total_size / 1_000_000,
+						percent,
+						if dur_ms > 1.0f64 { downloaded_size as f64 / dur_ms as f64 } else { 0f64 },
+						)
+					} else {
+						let start = start_time.timestamp_millis();
+						let fin = Utc::now().timestamp_millis();
+						let dur_secs = (fin - start) / 1000;
+
+						format!("Downloading chain state for fast sync. Waiting remote peer to start: {}s, step 2/4",
+										dur_secs,
+										)
 					}
-					SyncStatus::TxHashsetSave => {
-						"Finalizing chain state for fast sync, step 3/4".to_string()
-					}
-					SyncStatus::BodySync {
-						current_height,
-						highest_height,
-					} => {
-						let percent = if highest_height == 0 {
-							0
-						} else {
-							current_height * 100 / highest_height
-						};
-						format!("Downloading blocks: {}%, step 4/4", percent)
-					}
+				}
+				SyncStatus::TxHashsetSetup => {
+					"Preparing chain state for validation, step 3/4".to_string()
+				}
+				SyncStatus::TxHashsetValidation {
+					kernels,
+					kernel_total,
+					rproofs,
+					rproof_total,
+				} => {
+					// 10% of overall progress is attributed to kernel validation
+					// 90% to range proofs (which are much longer)
+					let mut percent = if kernel_total > 0 {
+						kernels * 10 / kernel_total
+					} else {
+						0
+					};
+					percent += if rproof_total > 0 {
+						rproofs * 90 / rproof_total
+					} else {
+						0
+					};
+					format!("Validating chain state: {}%, step 3/4", percent)
+				}
+				SyncStatus::TxHashsetSave => {
+					"Finalizing chain state for fast sync, step 3/4".to_string()
+				}
+				SyncStatus::BodySync {
+					current_height,
+					highest_height,
+				} => {
+					let percent = if highest_height == 0 {
+						0
+					} else {
+						current_height * 100 / highest_height
+					};
+					format!("Downloading blocks: {}%, step 4/4", percent)
 				}
 			}
 		};
@@ -164,7 +198,7 @@ impl TUIStatusListener for TUIStatusView {
 						),
 						format!(
 							"Cuckoo {} - Network Difficulty {}",
-							stats.mining_stats.cuckoo_size,
+							stats.mining_stats.edge_bits,
 							stats.mining_stats.network_difficulty.to_string()
 						),
 					)
@@ -184,6 +218,12 @@ impl TUIStatusListener for TUIStatusView {
 		});
 		c.call_on_id("basic_total_difficulty", |t: &mut TextView| {
 			t.set_content(stats.head.total_difficulty.to_string());
+		});
+		c.call_on_id("basic_header_chain_height", |t: &mut TextView| {
+			t.set_content(stats.header_head.height.to_string());
+		});
+		c.call_on_id("basic_header_total_difficulty", |t: &mut TextView| {
+			t.set_content(stats.header_head.total_difficulty.to_string());
 		});
 		/*c.call_on_id("basic_mining_config_status", |t: &mut TextView| {
 			t.set_content(basic_mining_config_status);

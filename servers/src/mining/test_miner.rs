@@ -19,18 +19,18 @@
 
 use chrono::prelude::Utc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use util::RwLock;
 
 use chain;
 use common::types::StratumServerConfig;
 use core::core::hash::{Hash, Hashed};
 use core::core::verifier_cache::VerifierCache;
 use core::core::{Block, BlockHeader};
-use core::pow::cuckoo;
-use core::{consensus, global};
+use core::global;
+use core::pow::PoWContext;
 use mining::mine_block;
 use pool;
-use util::LOGGER;
 
 pub struct Miner {
 	config: StratumServerConfig,
@@ -84,10 +84,9 @@ impl Miner {
 		let deadline = Utc::now().timestamp() + attempt_time_per_block as i64;
 
 		debug!(
-			LOGGER,
 			"(Server ID: {}) Mining Cuckoo{} for max {}s on {} @ {} [{}].",
 			self.debug_output_id,
-			global::min_sizeshift(),
+			global::min_edge_bits(),
 			attempt_time_per_block,
 			b.header.total_difficulty(),
 			b.header.height,
@@ -96,14 +95,13 @@ impl Miner {
 		let mut iter_count = 0;
 
 		while head.hash() == *latest_hash && Utc::now().timestamp() < deadline {
-			if let Ok(proof) = cuckoo::Miner::new(
-				&b.header,
-				consensus::EASINESS,
-				global::proofsize(),
-				global::min_sizeshift(),
-			).mine()
-			{
-				b.header.pow.proof = proof;
+			let mut ctx =
+				global::create_pow_context::<u32>(global::min_edge_bits(), global::proofsize(), 10)
+					.unwrap();
+			ctx.set_header_nonce(b.header.pre_pow(), None, true)
+				.unwrap();
+			if let Ok(proofs) = ctx.find_cycles() {
+				b.header.pow.proof = proofs[0].clone();
 				let proof_diff = b.header.pow.to_difficulty();
 				if proof_diff >= (b.header.total_difficulty() - head.total_difficulty()) {
 					return true;
@@ -116,10 +114,8 @@ impl Miner {
 		}
 
 		debug!(
-			LOGGER,
 			"(Server ID: {}) No solution found after {} iterations, continuing...",
-			self.debug_output_id,
-			iter_count
+			self.debug_output_id, iter_count
 		);
 		false
 	}
@@ -128,16 +124,16 @@ impl Miner {
 	/// chain anytime required and looking for PoW solution.
 	pub fn run_loop(&self, wallet_listener_url: Option<String>) {
 		info!(
-			LOGGER,
-			"(Server ID: {}) Starting test miner loop.", self.debug_output_id
+			"(Server ID: {}) Starting test miner loop.",
+			self.debug_output_id
 		);
 
 		// iteration, we keep the returned derivation to provide it back when
 		// nothing has changed. We only want to create a new key_id for each new block.
 		let mut key_id = None;
 
-		loop {
-			trace!(LOGGER, "in miner loop. key_id: {:?}", key_id);
+		while !self.stop.load(Ordering::Relaxed) {
+			trace!("in miner loop. key_id: {:?}", key_id);
 
 			// get the latest chain state and build a block on top of it
 			let head = self.chain.head_header().unwrap();
@@ -161,33 +157,29 @@ impl Miner {
 			// we found a solution, push our block through the chain processing pipeline
 			if sol {
 				info!(
-					LOGGER,
-					"(Server ID: {}) Found valid proof of work, adding block {}.",
+					"(Server ID: {}) Found valid proof of work, adding block {} (prev_root {}).",
 					self.debug_output_id,
-					b.hash()
+					b.hash(),
+					b.header.prev_root,
 				);
 				let res = self.chain.process_block(b, chain::Options::MINE);
 				if let Err(e) = res {
 					error!(
-						LOGGER,
 						"(Server ID: {}) Error validating mined block: {:?}",
-						self.debug_output_id,
-						e
+						self.debug_output_id, e
 					);
 				}
-				trace!(LOGGER, "resetting key_id in miner to None");
+				trace!("resetting key_id in miner to None");
 				key_id = None;
 			} else {
 				debug!(
-					LOGGER,
-					"setting pubkey in miner to pubkey from block_fees - {:?}", block_fees
+					"setting pubkey in miner to pubkey from block_fees - {:?}",
+					block_fees
 				);
 				key_id = block_fees.key_id();
 			}
-
-			if self.stop.load(Ordering::Relaxed) {
-				break;
-			}
 		}
+
+		info!("(Server ID: {}) test miner exit.", self.debug_output_id);
 	}
 }

@@ -12,15 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+extern crate chrono;
 extern crate croaring;
 extern crate env_logger;
 extern crate grin_core as core;
 extern crate grin_store as store;
-extern crate chrono;
 
+use chrono::prelude::Utc;
 use std::fs;
 use std::time::{Duration, Instant};
-use chrono::prelude::{Utc};
 
 use croaring::Bitmap;
 
@@ -101,7 +101,7 @@ fn setup(test_name: &str) -> (LeafSet, String) {
 	let _ = env_logger::init();
 	let data_dir = format!("./target/{}-{}", test_name, Utc::now().timestamp());
 	fs::create_dir_all(data_dir.clone()).unwrap();
-	let leaf_set = LeafSet::open(format!("{}/{}", data_dir, "utxo.bin")).unwrap();
+	let leaf_set = LeafSet::open(&format!("{}/{}", data_dir, "utxo.bin")).unwrap();
 	(leaf_set, data_dir)
 }
 

@@ -15,8 +15,6 @@
 //! Compact (roaring) bitmap representing the set of leaf positions
 //! that exist and are not currently pruned in the MMR.
 
-use std::fs::File;
-use std::io::{self, BufWriter, Read, Write};
 use std::path::Path;
 
 use croaring::Bitmap;
@@ -25,7 +23,10 @@ use core::core::hash::Hashed;
 use core::core::pmmr;
 use core::core::BlockHeader;
 use prune_list::PruneList;
-use util::LOGGER;
+use {read_bitmap, save_via_temp_file};
+
+use std::fs::File;
+use std::io::{self, BufWriter, Write};
 
 /// Compact (roaring) bitmap representing the set of positions of
 /// leaves that are currently unpruned in the MMR.
@@ -35,53 +36,40 @@ pub struct LeafSet {
 	bitmap_bak: Bitmap,
 }
 
-unsafe impl Send for LeafSet {}
-unsafe impl Sync for LeafSet {}
-
 impl LeafSet {
 	/// Open the remove log file.
 	/// The content of the file will be read in memory for fast checking.
-	pub fn open(path: String) -> io::Result<LeafSet> {
+	pub fn open(path: &str) -> io::Result<LeafSet> {
 		let file_path = Path::new(&path);
 		let bitmap = if file_path.exists() {
-			let mut bitmap_file = File::open(path.clone())?;
-			let mut buffer = vec![];
-			bitmap_file.read_to_end(&mut buffer)?;
-			Bitmap::deserialize(&buffer)
+			read_bitmap(file_path)?
 		} else {
 			Bitmap::create()
 		};
 
 		Ok(LeafSet {
-			path: path.clone(),
-			bitmap: bitmap.clone(),
+			path: path.to_string(),
 			bitmap_bak: bitmap.clone(),
+			bitmap,
 		})
 	}
 
 	/// Copies a snapshot of the utxo file into the primary utxo file.
-	pub fn copy_snapshot(path: String, cp_path: String) -> io::Result<()> {
+	pub fn copy_snapshot(path: &str, cp_path: &str) -> io::Result<()> {
 		let cp_file_path = Path::new(&cp_path);
 
 		if !cp_file_path.exists() {
-			debug!(LOGGER, "leaf_set: rewound leaf file not found: {}", cp_path);
+			debug!("leaf_set: rewound leaf file not found: {}", cp_path);
 			return Ok(());
 		}
 
-		let mut bitmap_file = File::open(cp_path.clone())?;
-		let mut buffer = vec![];
-		bitmap_file.read_to_end(&mut buffer)?;
-		let bitmap = Bitmap::deserialize(&buffer);
-
-		debug!(
-			LOGGER,
-			"leaf_set: copying rewound file {} to {}", cp_path, path
-		);
+		let bitmap = read_bitmap(cp_file_path)?;
+		debug!("leaf_set: copying rewound file {} to {}", cp_path, path);
 
 		let mut leaf_set = LeafSet {
-			path: path.clone(),
-			bitmap: bitmap.clone(),
+			path: path.to_string(),
 			bitmap_bak: bitmap.clone(),
+			bitmap,
 		};
 
 		leaf_set.flush()?;
@@ -172,14 +160,12 @@ impl LeafSet {
 		// First run the optimization step on the bitmap.
 		self.bitmap.run_optimize();
 
-		// TODO - consider writing this to disk in a tmp file and then renaming?
-
 		// Write the updated bitmap file to disk.
-		{
-			let mut file = BufWriter::new(File::create(self.path.clone())?);
-			file.write_all(&self.bitmap.serialize())?;
-			file.flush()?;
-		}
+		save_via_temp_file(&self.path, ".tmp", |w| {
+			let mut w = BufWriter::new(w);
+			w.write_all(&self.bitmap.serialize())?;
+			w.flush()
+		})?;
 
 		// Make sure our backup in memory is up to date.
 		self.bitmap_bak = self.bitmap.clone();

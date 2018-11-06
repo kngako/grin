@@ -23,6 +23,7 @@ use byteorder::{BigEndian, ByteOrder, ReadBytesExt};
 use consensus;
 use core::hash::{Hash, Hashed};
 use keychain::{BlindingFactor, Identifier, IDENTIFIER_SIZE};
+use std::fmt::Debug;
 use std::io::{self, Read, Write};
 use std::{cmp, error, fmt, mem};
 use util::secp::constants::{
@@ -92,10 +93,7 @@ impl error::Error for Error {
 	fn description(&self) -> &str {
 		match *self {
 			Error::IOErr(ref e, _) => e,
-			Error::UnexpectedData {
-				expected: _,
-				received: _,
-			} => "unexpected data",
+			Error::UnexpectedData { .. } => "unexpected data",
 			Error::CorruptedData => "corrupted data",
 			Error::TooLargeReadErr => "too large read",
 			Error::ConsensusError(_) => "consensus error (sort order)",
@@ -231,13 +229,13 @@ where
 
 /// Deserializes a Readeable from any std::io::Read implementation.
 pub fn deserialize<T: Readable>(source: &mut Read) -> Result<T, Error> {
-	let mut reader = BinReader { source: source };
+	let mut reader = BinReader { source };
 	T::read(&mut reader)
 }
 
 /// Serializes a Writeable into any std::io::Write implementation.
 pub fn serialize<W: Writeable>(sink: &mut Write, thing: &W) -> Result<(), Error> {
-	let mut writer = BinWriter { sink: sink };
+	let mut writer = BinWriter { sink };
 	thing.write(&mut writer)
 }
 
@@ -319,9 +317,7 @@ impl Readable for Commitment {
 	fn read(reader: &mut Reader) -> Result<Commitment, Error> {
 		let a = reader.read_fixed_bytes(PEDERSEN_COMMITMENT_SIZE)?;
 		let mut c = [0; PEDERSEN_COMMITMENT_SIZE];
-		for i in 0..PEDERSEN_COMMITMENT_SIZE {
-			c[i] = a[i];
-		}
+		c[..PEDERSEN_COMMITMENT_SIZE].clone_from_slice(&a[..PEDERSEN_COMMITMENT_SIZE]);
 		Ok(Commitment(c))
 	}
 }
@@ -368,9 +364,7 @@ impl Readable for RangeProof {
 	fn read(reader: &mut Reader) -> Result<RangeProof, Error> {
 		let p = reader.read_limited_vec(MAX_PROOF_SIZE)?;
 		let mut a = [0; MAX_PROOF_SIZE];
-		for i in 0..p.len() {
-			a[i] = p[i];
-		}
+		a[..p.len()].clone_from_slice(&p[..]);
 		Ok(RangeProof {
 			proof: a,
 			plen: p.len(),
@@ -378,19 +372,17 @@ impl Readable for RangeProof {
 	}
 }
 
-impl PMMRable for RangeProof {
-	fn len() -> usize {
-		MAX_PROOF_SIZE + 8
-	}
+impl FixedLength for RangeProof {
+	const LEN: usize = MAX_PROOF_SIZE + 8;
 }
+
+impl PMMRable for RangeProof {}
 
 impl Readable for Signature {
 	fn read(reader: &mut Reader) -> Result<Signature, Error> {
 		let a = reader.read_fixed_bytes(AGG_SIGNATURE_SIZE)?;
 		let mut c = [0; AGG_SIGNATURE_SIZE];
-		for i in 0..AGG_SIGNATURE_SIZE {
-			c[i] = a[i];
-		}
+		c[..AGG_SIGNATURE_SIZE].clone_from_slice(&a[..AGG_SIGNATURE_SIZE]);
 		Ok(Signature::from_raw_data(&c).unwrap())
 	}
 }
@@ -544,11 +536,17 @@ impl Writeable for [u8; 4] {
 	}
 }
 
-/// Trait for types that can serialize and report their size
-pub trait PMMRable: Readable + Writeable + Clone {
-	/// Length in bytes
-	fn len() -> usize;
+/// Trait for types that serialize to a known fixed length.
+pub trait FixedLength {
+	/// The length in bytes
+	const LEN: usize;
 }
+
+/// Trait for types that can be added to a "hash only" PMMR (block headers for example).
+pub trait HashOnlyPMMRable: Writeable + Clone + Debug {}
+
+/// Trait for types that can be added to a PMMR.
+pub trait PMMRable: FixedLength + Readable + Writeable + Clone + Debug {}
 
 /// Generic trait to ensure PMMR elements can be hashed with an index
 pub trait PMMRIndexHashable {
@@ -556,16 +554,9 @@ pub trait PMMRIndexHashable {
 	fn hash_with_index(&self, index: u64) -> Hash;
 }
 
-impl<T: PMMRable> PMMRIndexHashable for T {
+impl<T: Writeable> PMMRIndexHashable for T {
 	fn hash_with_index(&self, index: u64) -> Hash {
 		(index, self).hash()
-	}
-}
-
-// Convenient way to hash two existing hashes together with an index.
-impl PMMRIndexHashable for (Hash, Hash) {
-	fn hash_with_index(&self, index: u64) -> Hash {
-		(index, &self.0, &self.1).hash()
 	}
 }
 
@@ -577,81 +568,81 @@ pub trait AsFixedBytes: Sized + AsRef<[u8]> {
 
 impl<'a> AsFixedBytes for &'a [u8] {
 	fn len(&self) -> usize {
-		return 1;
+		1
 	}
 }
 impl AsFixedBytes for Vec<u8> {
 	fn len(&self) -> usize {
-		return self.len();
+		self.len()
 	}
 }
 impl AsFixedBytes for [u8; 1] {
 	fn len(&self) -> usize {
-		return 1;
+		1
 	}
 }
 impl AsFixedBytes for [u8; 2] {
 	fn len(&self) -> usize {
-		return 2;
+		2
 	}
 }
 impl AsFixedBytes for [u8; 4] {
 	fn len(&self) -> usize {
-		return 4;
+		4
 	}
 }
 impl AsFixedBytes for [u8; 6] {
 	fn len(&self) -> usize {
-		return 6;
+		6
 	}
 }
 impl AsFixedBytes for [u8; 8] {
 	fn len(&self) -> usize {
-		return 8;
+		8
 	}
 }
 impl AsFixedBytes for [u8; 20] {
 	fn len(&self) -> usize {
-		return 20;
+		20
 	}
 }
 impl AsFixedBytes for [u8; 32] {
 	fn len(&self) -> usize {
-		return 32;
+		32
 	}
 }
 impl AsFixedBytes for String {
 	fn len(&self) -> usize {
-		return self.len();
+		self.len()
 	}
 }
 impl AsFixedBytes for ::core::hash::Hash {
 	fn len(&self) -> usize {
-		return 32;
+		32
 	}
 }
 impl AsFixedBytes for ::util::secp::pedersen::RangeProof {
 	fn len(&self) -> usize {
-		return self.plen;
+		self.plen
 	}
 }
 impl AsFixedBytes for ::util::secp::Signature {
 	fn len(&self) -> usize {
-		return 64;
+		64
 	}
 }
 impl AsFixedBytes for ::util::secp::pedersen::Commitment {
 	fn len(&self) -> usize {
-		return PEDERSEN_COMMITMENT_SIZE;
+		PEDERSEN_COMMITMENT_SIZE
 	}
 }
 impl AsFixedBytes for BlindingFactor {
 	fn len(&self) -> usize {
-		return SECRET_KEY_SIZE;
+		SECRET_KEY_SIZE
 	}
 }
 impl AsFixedBytes for ::keychain::Identifier {
 	fn len(&self) -> usize {
-		return IDENTIFIER_SIZE;
+		IDENTIFIER_SIZE
 	}
 }

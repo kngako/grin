@@ -26,7 +26,6 @@ use error::{Error, ErrorKind};
 use failure::ResultExt;
 use keychain::Keychain;
 use util;
-use util::LOGGER;
 
 pub const SEED_FILE: &'static str = "wallet.seed";
 
@@ -39,21 +38,37 @@ pub struct WalletConfig {
 	pub api_listen_interface: String,
 	// The port this wallet will run on
 	pub api_listen_port: u16,
+	/// Location of the secret for basic auth on the Owner API
+	pub api_secret_path: Option<String>,
+	/// Location of the node api secret for basic auth on the Grin API
+	pub node_api_secret_path: Option<String>,
 	// The api address of a running server node against which transaction inputs
 	// will be checked during send
 	pub check_node_api_http_addr: String,
 	// The directory in which wallet files are stored
 	pub data_file_dir: String,
+	/// TLS ceritificate file
+	pub tls_certificate_file: Option<String>,
+	/// TLS ceritificate private key file
+	pub tls_certificate_key: Option<String>,
+	/// Whether to use the black background color scheme for command line
+	/// if enabled, wallet command output color will be suitable for black background terminal
+	pub dark_background_color_scheme: Option<bool>,
 }
 
 impl Default for WalletConfig {
 	fn default() -> WalletConfig {
 		WalletConfig {
-			chain_type: Some(ChainTypes::Testnet3),
+			chain_type: Some(ChainTypes::Testnet4),
 			api_listen_interface: "127.0.0.1".to_string(),
 			api_listen_port: 13415,
+			api_secret_path: Some(".api_secret".to_string()),
+			node_api_secret_path: Some(".api_secret".to_string()),
 			check_node_api_http_addr: "http://127.0.0.1:13413".to_string(),
 			data_file_dir: ".".to_string(),
+			tls_certificate_file: None,
+			tls_certificate_key: None,
+			dark_background_color_scheme: Some(true),
 		}
 	}
 }
@@ -106,7 +121,7 @@ impl WalletSeed {
 			wallet_config.data_file_dir, MAIN_SEPARATOR, SEED_FILE,
 		);
 
-		debug!(LOGGER, "Generating wallet seed file at: {}", seed_file_path);
+		debug!("Generating wallet seed file at: {}", seed_file_path);
 
 		if Path::new(seed_file_path).exists() {
 			Err(ErrorKind::WalletSeedExists)?
@@ -128,7 +143,7 @@ impl WalletSeed {
 			wallet_config.data_file_dir, MAIN_SEPARATOR, SEED_FILE,
 		);
 
-		debug!(LOGGER, "Using wallet seed file at: {}", seed_file_path,);
+		debug!("Using wallet seed file at: {}", seed_file_path,);
 
 		if Path::new(seed_file_path).exists() {
 			let mut file = File::open(seed_file_path).context(ErrorKind::IO)?;
@@ -138,7 +153,6 @@ impl WalletSeed {
 			Ok(wallet_seed)
 		} else {
 			error!(
-				LOGGER,
 				"wallet seed file {} could not be opened (grin wallet init). \
 				 Run \"grin wallet init\" to initialize a new wallet.",
 				seed_file_path

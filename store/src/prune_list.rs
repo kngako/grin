@@ -21,15 +21,13 @@
 //! must be shifted the appropriate amount when reading from the hash and data
 //! files.
 
-use std::fs::File;
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
 use croaring::Bitmap;
 
 use core::core::pmmr::{bintree_postorder_height, family, path};
-
-use util::LOGGER;
+use {read_bitmap, save_via_temp_file};
 
 /// Maintains a list of previously pruned nodes in PMMR, compacting the list as
 /// parents get pruned and allowing checking whether a leaf is pruned. Given
@@ -52,9 +50,6 @@ pub struct PruneList {
 	leaf_shift_cache: Vec<u64>,
 }
 
-unsafe impl Send for PruneList {}
-unsafe impl Sync for PruneList {}
-
 impl PruneList {
 	/// Instantiate a new empty prune list
 	pub fn new() -> PruneList {
@@ -68,19 +63,16 @@ impl PruneList {
 	}
 
 	/// Open an existing prune_list or create a new one.
-	pub fn open(path: String) -> io::Result<PruneList> {
+	pub fn open(path: &str) -> io::Result<PruneList> {
 		let file_path = Path::new(&path);
 		let bitmap = if file_path.exists() {
-			let mut bitmap_file = File::open(path.clone())?;
-			let mut buffer = vec![];
-			bitmap_file.read_to_end(&mut buffer)?;
-			Bitmap::deserialize(&buffer)
+			read_bitmap(&file_path)?
 		} else {
 			Bitmap::create()
 		};
 
 		let mut prune_list = PruneList {
-			path: Some(path.clone()),
+			path: Some(path.to_string()),
 			bitmap,
 			pruned_cache: Bitmap::create(),
 			shift_cache: vec![],
@@ -91,7 +83,7 @@ impl PruneList {
 		prune_list.init_caches();
 
 		if !prune_list.bitmap.is_empty() {
-			debug!(LOGGER, "prune_list: bitmap {} pos ({} bytes), pruned_cache {} pos ({} bytes), shift_cache {}, leaf_shift_cache {}",
+			debug!("prune_list: bitmap {} pos ({} bytes), pruned_cache {} pos ({} bytes), shift_cache {}, leaf_shift_cache {}",
 				prune_list.bitmap.cardinality(),
 				prune_list.bitmap.get_serialized_size_in_bytes(),
 				prune_list.pruned_cache.cardinality(),
@@ -117,13 +109,13 @@ impl PruneList {
 		// Run the optimization step on the bitmap.
 		self.bitmap.run_optimize();
 
-		// TODO - consider writing this to disk in a tmp file and then renaming?
-
 		// Write the updated bitmap file to disk.
 		if let Some(ref path) = self.path {
-			let mut file = BufWriter::new(File::create(path)?);
-			file.write_all(&self.bitmap.serialize())?;
-			file.flush()?;
+			save_via_temp_file(&path, ".tmp", |w| {
+				let mut w = BufWriter::new(w);
+				w.write_all(&self.bitmap.serialize())?;
+				w.flush()
+			})?;
 		}
 
 		// Rebuild our "shift caches" here as we are flushing changes to disk

@@ -28,11 +28,10 @@ extern crate lmdb_zero;
 extern crate memmap;
 extern crate serde;
 #[macro_use]
-extern crate slog;
+extern crate log;
 extern crate failure;
 #[macro_use]
 extern crate failure_derive;
-
 #[macro_use]
 extern crate grin_core as core;
 extern crate grin_util as util;
@@ -41,39 +40,13 @@ pub mod leaf_set;
 mod lmdb;
 pub mod pmmr;
 pub mod prune_list;
-pub mod rm_log;
 pub mod types;
 
-const SEP: u8 = ':' as u8;
+const SEP: u8 = b':';
 
 use byteorder::{BigEndian, WriteBytesExt};
 
 pub use lmdb::*;
-
-/// An iterator thad produces Readable instances back. Wraps the lower level
-/// DBIterator and deserializes the returned values.
-// pub struct SerIterator<T>
-// where
-// 	T: ser::Readable,
-// {
-// 	iter: DBIterator,
-// 	_marker: marker::PhantomData<T>,
-// }
-//
-// impl<T> Iterator for SerIterator<T>
-// where
-// 	T: ser::Readable,
-// {
-// 	type Item = T;
-//
-// 	fn next(&mut self) -> Option<T> {
-// 		let next = self.iter.next();
-// 		next.and_then(|r| {
-// 			let (_, v) = r;
-// 			ser::deserialize(&mut &v[..]).ok()
-// 		})
-// 	}
-// }
 
 /// Build a db key from a prefix and a byte vector identifier.
 pub fn to_key(prefix: u8, k: &mut Vec<u8>) -> Vec<u8> {
@@ -84,11 +57,69 @@ pub fn to_key(prefix: u8, k: &mut Vec<u8>) -> Vec<u8> {
 	res
 }
 
+/// Build a db key from a prefix and a byte vector identifier and numeric identifier
+pub fn to_key_u64(prefix: u8, k: &mut Vec<u8>, val: u64) -> Vec<u8> {
+	let mut res = vec![];
+	res.push(prefix);
+	res.push(SEP);
+	res.append(k);
+	res.write_u64::<BigEndian>(val).unwrap();
+	res
+}
 /// Build a db key from a prefix and a numeric identifier.
-pub fn u64_to_key<'a>(prefix: u8, val: u64) -> Vec<u8> {
+pub fn u64_to_key(prefix: u8, val: u64) -> Vec<u8> {
 	let mut u64_vec = vec![];
 	u64_vec.write_u64::<BigEndian>(val).unwrap();
 	u64_vec.insert(0, SEP);
 	u64_vec.insert(0, prefix);
 	u64_vec
+}
+
+/// Creates temporary file with name created by adding `temp_suffix` to `path`.
+/// Applies writer function to it and renames temporary file into original specified by `path`.
+pub fn save_via_temp_file<F>(
+	path: &str,
+	temp_suffix: &str,
+	mut writer: F,
+) -> Result<(), std::io::Error>
+where
+	F: FnMut(Box<std::io::Write>) -> Result<(), std::io::Error>,
+{
+	assert_ne!(*temp_suffix, *"");
+
+	use std::fs::{remove_file, rename, File};
+	use std::path::Path;
+
+	// Write temporary file
+	let temp_name = format!("{}{}", &path, temp_suffix);
+	let temp_path = Path::new(&temp_name);
+	if temp_path.exists() {
+		remove_file(&temp_path)?;
+	}
+
+	let file = File::create(&temp_path)?;
+	writer(Box::new(file))?;
+
+	// Move temporary file into original
+	let original = Path::new(&path);
+	if original.exists() {
+		remove_file(&original)?;
+	}
+
+	rename(&temp_path, &original)?;
+
+	Ok(())
+}
+
+use croaring::Bitmap;
+use std::io::{self, Read};
+use std::path::Path;
+/// Read Bitmap from a file
+pub fn read_bitmap<P: AsRef<Path>>(file_path: P) -> io::Result<Bitmap> {
+	use std::fs::File;
+	let mut bitmap_file = File::open(file_path)?;
+	let f_md = bitmap_file.metadata()?;
+	let mut buffer = Vec::with_capacity(f_md.len() as usize);
+	bitmap_file.read_to_end(&mut buffer)?;
+	Ok(Bitmap::deserialize(&buffer))
 }

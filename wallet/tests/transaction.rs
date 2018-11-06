@@ -20,7 +20,7 @@ extern crate grin_util as util;
 extern crate grin_wallet as wallet;
 extern crate rand;
 #[macro_use]
-extern crate slog;
+extern crate log;
 extern crate chrono;
 extern crate serde;
 extern crate uuid;
@@ -35,7 +35,6 @@ use std::time::Duration;
 use core::global;
 use core::global::ChainTypes;
 use keychain::ExtKeychain;
-use util::LOGGER;
 use wallet::libtx::slate::Slate;
 use wallet::libwallet;
 use wallet::libwallet::types::OutputStatus;
@@ -53,10 +52,7 @@ fn setup(test_dir: &str) {
 /// Exercises the Transaction API fully with a test WalletClient operating
 /// directly on a chain instance
 /// Callable with any type of wallet
-fn basic_transaction_api(
-	test_dir: &str,
-	backend_type: common::BackendType,
-) -> Result<(), libwallet::Error> {
+fn basic_transaction_api(test_dir: &str) -> Result<(), libwallet::Error> {
 	setup(test_dir);
 	// Create a new proxy to simulate server and wallet responses
 	let mut wallet_proxy: WalletProxy<LocalWalletClient, ExtKeychain> = WalletProxy::new(test_dir);
@@ -65,43 +61,33 @@ fn basic_transaction_api(
 	// Create a new wallet test client, and set its queues to communicate with the
 	// proxy
 	let client = LocalWalletClient::new("wallet1", wallet_proxy.tx.clone());
-	let wallet1 = common::create_wallet(
-		&format!("{}/wallet1", test_dir),
-		client.clone(),
-		backend_type.clone(),
-	);
+	let wallet1 = common::create_wallet(&format!("{}/wallet1", test_dir), client.clone());
 	wallet_proxy.add_wallet("wallet1", client.get_send_instance(), wallet1.clone());
 
 	// define recipient wallet, add to proxy
+	let wallet2 = common::create_wallet(&format!("{}/wallet2", test_dir), client.clone());
 	let client = LocalWalletClient::new("wallet2", wallet_proxy.tx.clone());
-	let wallet2 = common::create_wallet(
-		&format!("{}/wallet2", test_dir),
-		client.clone(),
-		backend_type.clone(),
-	);
 	wallet_proxy.add_wallet("wallet2", client.get_send_instance(), wallet2.clone());
 
 	// Set the wallet proxy listener running
 	thread::spawn(move || {
 		if let Err(e) = wallet_proxy.run() {
-			error!(LOGGER, "Wallet Proxy error: {}", e);
+			error!("Wallet Proxy error: {}", e);
 		}
 	});
 
 	// few values to keep things shorter
 	let reward = core::consensus::REWARD;
-	let cm = global::coinbase_maturity(0); // assume all testing precedes soft fork height
-	// mine a few blocks
+	let cm = global::coinbase_maturity(); // assume all testing precedes soft fork height
+									   // mine a few blocks
 	let _ = common::award_blocks_to_wallet(&chain, wallet1.clone(), 10);
 
 	// Check wallet 1 contents are as expected
 	wallet::controller::owner_single_use(wallet1.clone(), |api| {
 		let (wallet1_refreshed, wallet1_info) = api.retrieve_summary_info(true)?;
 		debug!(
-			LOGGER,
 			"Wallet 1 Info Pre-Transaction, after {} blocks: {:?}",
-			wallet1_info.last_confirmed_height,
-			wallet1_info
+			wallet1_info.last_confirmed_height, wallet1_info
 		);
 		assert!(wallet1_refreshed);
 		assert_eq!(
@@ -177,10 +163,8 @@ fn basic_transaction_api(
 	wallet::controller::owner_single_use(wallet1.clone(), |api| {
 		let (wallet1_refreshed, wallet1_info) = api.retrieve_summary_info(true)?;
 		debug!(
-			LOGGER,
 			"Wallet 1 Info Post Transaction, after {} blocks: {:?}",
-			wallet1_info.last_confirmed_height,
-			wallet1_info
+			wallet1_info.last_confirmed_height, wallet1_info
 		);
 		let fee = wallet::libtx::tx_fee(
 			wallet1_info.last_confirmed_height as usize - 1 - cm as usize,
@@ -218,7 +202,7 @@ fn basic_transaction_api(
 	// refresh wallets and retrieve info/tests for each wallet after maturity
 	wallet::controller::owner_single_use(wallet1.clone(), |api| {
 		let (wallet1_refreshed, wallet1_info) = api.retrieve_summary_info(true)?;
-		debug!(LOGGER, "Wallet 1 Info: {:?}", wallet1_info);
+		debug!("Wallet 1 Info: {:?}", wallet1_info);
 		assert!(wallet1_refreshed);
 		assert_eq!(
 			wallet1_info.total,
@@ -309,7 +293,7 @@ fn basic_transaction_api(
 
 /// Test rolling back transactions and outputs when a transaction is never
 /// posted to a chain
-fn tx_rollback(test_dir: &str, backend_type: common::BackendType) -> Result<(), libwallet::Error> {
+fn tx_rollback(test_dir: &str) -> Result<(), libwallet::Error> {
 	setup(test_dir);
 	// Create a new proxy to simulate server and wallet responses
 	let mut wallet_proxy: WalletProxy<LocalWalletClient, ExtKeychain> = WalletProxy::new(test_dir);
@@ -318,33 +302,25 @@ fn tx_rollback(test_dir: &str, backend_type: common::BackendType) -> Result<(), 
 	// Create a new wallet test client, and set its queues to communicate with the
 	// proxy
 	let client = LocalWalletClient::new("wallet1", wallet_proxy.tx.clone());
-	let wallet1 = common::create_wallet(
-		&format!("{}/wallet1", test_dir),
-		client.clone(),
-		backend_type.clone(),
-	);
+	let wallet1 = common::create_wallet(&format!("{}/wallet1", test_dir), client.clone());
 	wallet_proxy.add_wallet("wallet1", client.get_send_instance(), wallet1.clone());
 
 	// define recipient wallet, add to proxy
 	let client = LocalWalletClient::new("wallet2", wallet_proxy.tx.clone());
-	let wallet2 = common::create_wallet(
-		&format!("{}/wallet2", test_dir),
-		client.clone(),
-		backend_type.clone(),
-	);
+	let wallet2 = common::create_wallet(&format!("{}/wallet2", test_dir), client.clone());
 	wallet_proxy.add_wallet("wallet2", client.get_send_instance(), wallet2.clone());
 
 	// Set the wallet proxy listener running
 	thread::spawn(move || {
 		if let Err(e) = wallet_proxy.run() {
-			error!(LOGGER, "Wallet Proxy error: {}", e);
+			error!("Wallet Proxy error: {}", e);
 		}
 	});
 
 	// few values to keep things shorter
 	let reward = core::consensus::REWARD;
-	let cm = global::coinbase_maturity(0); // assume all testing precedes soft fork height
-	// mine a few blocks
+	let cm = global::coinbase_maturity(); // assume all testing precedes soft fork height
+									   // mine a few blocks
 	let _ = common::award_blocks_to_wallet(&chain, wallet1.clone(), 5);
 
 	let amount = 30_000_000_000;
@@ -364,7 +340,11 @@ fn tx_rollback(test_dir: &str, backend_type: common::BackendType) -> Result<(), 
 
 	// Check transaction log for wallet 1
 	wallet::controller::owner_single_use(wallet1.clone(), |api| {
-		let (refreshed, _wallet1_info) = api.retrieve_summary_info(true)?;
+		let (refreshed, wallet1_info) = api.retrieve_summary_info(true)?;
+		println!(
+			"last confirmed height: {}",
+			wallet1_info.last_confirmed_height
+		);
 		assert!(refreshed);
 		let (_, txs) = api.retrieve_txs(true, None)?;
 		// we should have a transaction entry for this slate
@@ -428,7 +408,12 @@ fn tx_rollback(test_dir: &str, backend_type: common::BackendType) -> Result<(), 
 		api.cancel_tx(tx.id)?;
 		let (refreshed, wallet1_info) = api.retrieve_summary_info(true)?;
 		assert!(refreshed);
+		println!(
+			"last confirmed height: {}",
+			wallet1_info.last_confirmed_height
+		);
 		// check all eligible inputs should be now be spendable
+		println!("cm: {}", cm);
 		assert_eq!(
 			wallet1_info.amount_currently_spendable,
 			(wallet1_info.last_confirmed_height - cm) * reward
@@ -465,25 +450,18 @@ fn tx_rollback(test_dir: &str, backend_type: common::BackendType) -> Result<(), 
 	Ok(())
 }
 
-#[ignore]
-#[test]
-fn file_wallet_basic_transaction_api() {
-	let test_dir = "test_output/basic_transaction_api_file";
-	let _ = basic_transaction_api(test_dir, common::BackendType::FileBackend);
-}
-
 #[test]
 fn db_wallet_basic_transaction_api() {
-	let test_dir = "test_output/basic_transaction_api_db";
-	if let Err(e) = basic_transaction_api(test_dir, common::BackendType::LMDBBackend) {
+	let test_dir = "test_output/basic_transaction_api";
+	if let Err(e) = basic_transaction_api(test_dir) {
 		println!("Libwallet Error: {}", e);
 	}
 }
 
 #[test]
 fn db_wallet_tx_rollback() {
-	let test_dir = "test_output/tx_rollback_db";
-	if let Err(e) = tx_rollback(test_dir, common::BackendType::LMDBBackend) {
+	let test_dir = "test_output/tx_rollback";
+	if let Err(e) = tx_rollback(test_dir) {
 		println!("Libwallet Error: {}", e);
 	}
 }

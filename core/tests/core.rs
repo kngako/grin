@@ -18,7 +18,8 @@ extern crate grin_keychain as keychain;
 extern crate grin_util as util;
 extern crate grin_wallet as wallet;
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use util::RwLock;
 
 pub mod common;
 
@@ -30,7 +31,7 @@ use grin_core::core::verifier_cache::{LruVerifierCache, VerifierCache};
 use grin_core::core::{aggregate, deaggregate, KernelFeatures, Output, Transaction};
 use grin_core::ser;
 use keychain::{BlindingFactor, ExtKeychain, Keychain};
-use util::{secp_static, static_secp_instance};
+use util::static_secp_instance;
 use wallet::libtx::build::{
 	self, initial_tx, input, output, with_excess, with_fee, with_lock_height,
 };
@@ -77,7 +78,7 @@ fn tx_double_ser_deser() {
 #[should_panic(expected = "InvalidSecretKey")]
 fn test_zero_commit_fails() {
 	let keychain = ExtKeychain::from_random_seed().unwrap();
-	let key_id1 = keychain.derive_key_id(1).unwrap();
+	let key_id1 = ExtKeychain::derive_key_id(1, 1, 0, 0, 0);
 
 	// blinding should fail as signing with a zero r*G shouldn't work
 	build::transaction(
@@ -97,9 +98,9 @@ fn verifier_cache() -> Arc<RwLock<VerifierCache>> {
 #[test]
 fn build_tx_kernel() {
 	let keychain = ExtKeychain::from_random_seed().unwrap();
-	let key_id1 = keychain.derive_key_id(1).unwrap();
-	let key_id2 = keychain.derive_key_id(2).unwrap();
-	let key_id3 = keychain.derive_key_id(3).unwrap();
+	let key_id1 = ExtKeychain::derive_key_id(1, 1, 0, 0, 0);
+	let key_id2 = ExtKeychain::derive_key_id(1, 2, 0, 0, 0);
+	let key_id3 = ExtKeychain::derive_key_id(1, 3, 0, 0, 0);
 
 	// first build a valid tx with corresponding blinding factor
 	let tx = build::transaction(
@@ -137,7 +138,7 @@ fn transaction_cut_through() {
 	let vc = verifier_cache();
 
 	// now build a "cut_through" tx from tx1 and tx2
-	let tx3 = aggregate(vec![tx1, tx2], vc.clone()).unwrap();
+	let tx3 = aggregate(vec![tx1, tx2]).unwrap();
 
 	assert!(tx3.validate(vc.clone()).is_ok());
 }
@@ -157,22 +158,19 @@ fn multi_kernel_transaction_deaggregation() {
 	assert!(tx3.validate(vc.clone()).is_ok());
 	assert!(tx4.validate(vc.clone()).is_ok());
 
-	let tx1234 = aggregate(
-		vec![tx1.clone(), tx2.clone(), tx3.clone(), tx4.clone()],
-		vc.clone(),
-	).unwrap();
-	let tx12 = aggregate(vec![tx1.clone(), tx2.clone()], vc.clone()).unwrap();
-	let tx34 = aggregate(vec![tx3.clone(), tx4.clone()], vc.clone()).unwrap();
+	let tx1234 = aggregate(vec![tx1.clone(), tx2.clone(), tx3.clone(), tx4.clone()]).unwrap();
+	let tx12 = aggregate(vec![tx1.clone(), tx2.clone()]).unwrap();
+	let tx34 = aggregate(vec![tx3.clone(), tx4.clone()]).unwrap();
 
 	assert!(tx1234.validate(vc.clone()).is_ok());
 	assert!(tx12.validate(vc.clone()).is_ok());
 	assert!(tx34.validate(vc.clone()).is_ok());
 
-	let deaggregated_tx34 = deaggregate(tx1234.clone(), vec![tx12.clone()], vc.clone()).unwrap();
+	let deaggregated_tx34 = deaggregate(tx1234.clone(), vec![tx12.clone()]).unwrap();
 	assert!(deaggregated_tx34.validate(vc.clone()).is_ok());
 	assert_eq!(tx34, deaggregated_tx34);
 
-	let deaggregated_tx12 = deaggregate(tx1234.clone(), vec![tx34.clone()], vc.clone()).unwrap();
+	let deaggregated_tx12 = deaggregate(tx1234.clone(), vec![tx34.clone()]).unwrap();
 
 	assert!(deaggregated_tx12.validate(vc.clone()).is_ok());
 	assert_eq!(tx12, deaggregated_tx12);
@@ -190,13 +188,13 @@ fn multi_kernel_transaction_deaggregation_2() {
 	assert!(tx2.validate(vc.clone()).is_ok());
 	assert!(tx3.validate(vc.clone()).is_ok());
 
-	let tx123 = aggregate(vec![tx1.clone(), tx2.clone(), tx3.clone()], vc.clone()).unwrap();
-	let tx12 = aggregate(vec![tx1.clone(), tx2.clone()], vc.clone()).unwrap();
+	let tx123 = aggregate(vec![tx1.clone(), tx2.clone(), tx3.clone()]).unwrap();
+	let tx12 = aggregate(vec![tx1.clone(), tx2.clone()]).unwrap();
 
 	assert!(tx123.validate(vc.clone()).is_ok());
 	assert!(tx12.validate(vc.clone()).is_ok());
 
-	let deaggregated_tx3 = deaggregate(tx123.clone(), vec![tx12.clone()], vc.clone()).unwrap();
+	let deaggregated_tx3 = deaggregate(tx123.clone(), vec![tx12.clone()]).unwrap();
 	assert!(deaggregated_tx3.validate(vc.clone()).is_ok());
 	assert_eq!(tx3, deaggregated_tx3);
 }
@@ -213,14 +211,14 @@ fn multi_kernel_transaction_deaggregation_3() {
 	assert!(tx2.validate(vc.clone()).is_ok());
 	assert!(tx3.validate(vc.clone()).is_ok());
 
-	let tx123 = aggregate(vec![tx1.clone(), tx2.clone(), tx3.clone()], vc.clone()).unwrap();
-	let tx13 = aggregate(vec![tx1.clone(), tx3.clone()], vc.clone()).unwrap();
-	let tx2 = aggregate(vec![tx2.clone()], vc.clone()).unwrap();
+	let tx123 = aggregate(vec![tx1.clone(), tx2.clone(), tx3.clone()]).unwrap();
+	let tx13 = aggregate(vec![tx1.clone(), tx3.clone()]).unwrap();
+	let tx2 = aggregate(vec![tx2.clone()]).unwrap();
 
 	assert!(tx123.validate(vc.clone()).is_ok());
 	assert!(tx2.validate(vc.clone()).is_ok());
 
-	let deaggregated_tx13 = deaggregate(tx123.clone(), vec![tx2.clone()], vc.clone()).unwrap();
+	let deaggregated_tx13 = deaggregate(tx123.clone(), vec![tx2.clone()]).unwrap();
 	assert!(deaggregated_tx13.validate(vc.clone()).is_ok());
 	assert_eq!(tx13, deaggregated_tx13);
 }
@@ -241,22 +239,18 @@ fn multi_kernel_transaction_deaggregation_4() {
 	assert!(tx4.validate(vc.clone()).is_ok());
 	assert!(tx5.validate(vc.clone()).is_ok());
 
-	let tx12345 = aggregate(
-		vec![
-			tx1.clone(),
-			tx2.clone(),
-			tx3.clone(),
-			tx4.clone(),
-			tx5.clone(),
-		],
-		vc.clone(),
-	).unwrap();
+	let tx12345 = aggregate(vec![
+		tx1.clone(),
+		tx2.clone(),
+		tx3.clone(),
+		tx4.clone(),
+		tx5.clone(),
+	]).unwrap();
 	assert!(tx12345.validate(vc.clone()).is_ok());
 
 	let deaggregated_tx5 = deaggregate(
 		tx12345.clone(),
 		vec![tx1.clone(), tx2.clone(), tx3.clone(), tx4.clone()],
-		vc.clone(),
 	).unwrap();
 	assert!(deaggregated_tx5.validate(vc.clone()).is_ok());
 	assert_eq!(tx5, deaggregated_tx5);
@@ -278,26 +272,19 @@ fn multi_kernel_transaction_deaggregation_5() {
 	assert!(tx4.validate(vc.clone()).is_ok());
 	assert!(tx5.validate(vc.clone()).is_ok());
 
-	let tx12345 = aggregate(
-		vec![
-			tx1.clone(),
-			tx2.clone(),
-			tx3.clone(),
-			tx4.clone(),
-			tx5.clone(),
-		],
-		vc.clone(),
-	).unwrap();
-	let tx12 = aggregate(vec![tx1.clone(), tx2.clone()], vc.clone()).unwrap();
-	let tx34 = aggregate(vec![tx3.clone(), tx4.clone()], vc.clone()).unwrap();
+	let tx12345 = aggregate(vec![
+		tx1.clone(),
+		tx2.clone(),
+		tx3.clone(),
+		tx4.clone(),
+		tx5.clone(),
+	]).unwrap();
+	let tx12 = aggregate(vec![tx1.clone(), tx2.clone()]).unwrap();
+	let tx34 = aggregate(vec![tx3.clone(), tx4.clone()]).unwrap();
 
 	assert!(tx12345.validate(vc.clone()).is_ok());
 
-	let deaggregated_tx5 = deaggregate(
-		tx12345.clone(),
-		vec![tx12.clone(), tx34.clone()],
-		vc.clone(),
-	).unwrap();
+	let deaggregated_tx5 = deaggregate(tx12345.clone(), vec![tx12.clone(), tx34.clone()]).unwrap();
 	assert!(deaggregated_tx5.validate(vc.clone()).is_ok());
 	assert_eq!(tx5, deaggregated_tx5);
 }
@@ -314,16 +301,16 @@ fn basic_transaction_deaggregation() {
 	assert!(tx2.validate(vc.clone()).is_ok());
 
 	// now build a "cut_through" tx from tx1 and tx2
-	let tx3 = aggregate(vec![tx1.clone(), tx2.clone()], vc.clone()).unwrap();
+	let tx3 = aggregate(vec![tx1.clone(), tx2.clone()]).unwrap();
 
 	assert!(tx3.validate(vc.clone()).is_ok());
 
-	let deaggregated_tx1 = deaggregate(tx3.clone(), vec![tx2.clone()], vc.clone()).unwrap();
+	let deaggregated_tx1 = deaggregate(tx3.clone(), vec![tx2.clone()]).unwrap();
 
 	assert!(deaggregated_tx1.validate(vc.clone()).is_ok());
 	assert_eq!(tx1, deaggregated_tx1);
 
-	let deaggregated_tx2 = deaggregate(tx3.clone(), vec![tx1.clone()], vc.clone()).unwrap();
+	let deaggregated_tx2 = deaggregate(tx3.clone(), vec![tx1.clone()]).unwrap();
 
 	assert!(deaggregated_tx2.validate(vc.clone()).is_ok());
 	assert_eq!(tx2, deaggregated_tx2);
@@ -332,9 +319,9 @@ fn basic_transaction_deaggregation() {
 #[test]
 fn hash_output() {
 	let keychain = ExtKeychain::from_random_seed().unwrap();
-	let key_id1 = keychain.derive_key_id(1).unwrap();
-	let key_id2 = keychain.derive_key_id(2).unwrap();
-	let key_id3 = keychain.derive_key_id(3).unwrap();
+	let key_id1 = ExtKeychain::derive_key_id(1, 1, 0, 0, 0);
+	let key_id2 = ExtKeychain::derive_key_id(1, 2, 0, 0, 0);
+	let key_id3 = ExtKeychain::derive_key_id(1, 3, 0, 0, 0);
 
 	let tx = build::transaction(
 		vec![
@@ -364,7 +351,7 @@ fn blind_tx() {
 	let Output { proof, .. } = btx.outputs()[0];
 
 	let secp = static_secp_instance();
-	let secp = secp.lock().unwrap();
+	let secp = secp.lock();
 	let info = secp.range_proof_info(proof);
 
 	assert!(info.min == 0);
@@ -386,10 +373,10 @@ fn tx_hash_diff() {
 #[test]
 fn tx_build_exchange() {
 	let keychain = ExtKeychain::from_random_seed().unwrap();
-	let key_id1 = keychain.derive_key_id(1).unwrap();
-	let key_id2 = keychain.derive_key_id(2).unwrap();
-	let key_id3 = keychain.derive_key_id(3).unwrap();
-	let key_id4 = keychain.derive_key_id(4).unwrap();
+	let key_id1 = ExtKeychain::derive_key_id(1, 1, 0, 0, 0);
+	let key_id2 = ExtKeychain::derive_key_id(1, 2, 0, 0, 0);
+	let key_id3 = ExtKeychain::derive_key_id(1, 3, 0, 0, 0);
+	let key_id4 = ExtKeychain::derive_key_id(1, 4, 0, 0, 0);
 
 	let (tx_alice, blind_sum) = {
 		// Alice gets 2 of her pre-existing outputs to send 5 coins to Bob, they
@@ -423,9 +410,7 @@ fn tx_build_exchange() {
 #[test]
 fn reward_empty_block() {
 	let keychain = keychain::ExtKeychain::from_random_seed().unwrap();
-	let key_id = keychain.derive_key_id(1).unwrap();
-
-	let zero_commit = secp_static::commit_to_zero_value();
+	let key_id = ExtKeychain::derive_key_id(1, 1, 0, 0, 0);
 
 	let previous_header = BlockHeader::default();
 
@@ -433,18 +418,16 @@ fn reward_empty_block() {
 
 	b.cut_through()
 		.unwrap()
-		.validate(&BlindingFactor::zero(), &zero_commit, verifier_cache())
+		.validate(&BlindingFactor::zero(), verifier_cache())
 		.unwrap();
 }
 
 #[test]
 fn reward_with_tx_block() {
 	let keychain = keychain::ExtKeychain::from_random_seed().unwrap();
-	let key_id = keychain.derive_key_id(1).unwrap();
+	let key_id = ExtKeychain::derive_key_id(1, 1, 0, 0, 0);
 
 	let vc = verifier_cache();
-
-	let zero_commit = secp_static::commit_to_zero_value();
 
 	let mut tx1 = tx2i1o();
 	tx1.validate(vc.clone()).unwrap();
@@ -455,18 +438,16 @@ fn reward_with_tx_block() {
 	block
 		.cut_through()
 		.unwrap()
-		.validate(&BlindingFactor::zero(), &zero_commit, vc.clone())
+		.validate(&BlindingFactor::zero(), vc.clone())
 		.unwrap();
 }
 
 #[test]
 fn simple_block() {
 	let keychain = keychain::ExtKeychain::from_random_seed().unwrap();
-	let key_id = keychain.derive_key_id(1).unwrap();
+	let key_id = ExtKeychain::derive_key_id(1, 1, 0, 0, 0);
 
 	let vc = verifier_cache();
-
-	let zero_commit = secp_static::commit_to_zero_value();
 
 	let mut tx1 = tx2i1o();
 	let mut tx2 = tx1i1o();
@@ -479,21 +460,18 @@ fn simple_block() {
 		&key_id,
 	);
 
-	b.validate(&BlindingFactor::zero(), &zero_commit, vc.clone())
-		.unwrap();
+	b.validate(&BlindingFactor::zero(), vc.clone()).unwrap();
 }
 
 #[test]
 fn test_block_with_timelocked_tx() {
 	let keychain = keychain::ExtKeychain::from_random_seed().unwrap();
 
-	let key_id1 = keychain.derive_key_id(1).unwrap();
-	let key_id2 = keychain.derive_key_id(2).unwrap();
-	let key_id3 = keychain.derive_key_id(3).unwrap();
+	let key_id1 = ExtKeychain::derive_key_id(1, 1, 0, 0, 0);
+	let key_id2 = ExtKeychain::derive_key_id(1, 2, 0, 0, 0);
+	let key_id3 = ExtKeychain::derive_key_id(1, 3, 0, 0, 0);
 
 	let vc = verifier_cache();
-
-	let zero_commit = secp_static::commit_to_zero_value();
 
 	// first check we can add a timelocked tx where lock height matches current
 	// block height and that the resulting block is valid
@@ -510,8 +488,7 @@ fn test_block_with_timelocked_tx() {
 	let previous_header = BlockHeader::default();
 
 	let b = new_block(vec![&tx1], &keychain, &previous_header, &key_id3.clone());
-	b.validate(&BlindingFactor::zero(), &zero_commit, vc.clone())
-		.unwrap();
+	b.validate(&BlindingFactor::zero(), vc.clone()).unwrap();
 
 	// now try adding a timelocked tx where lock height is greater than current
 	// block height
@@ -528,7 +505,7 @@ fn test_block_with_timelocked_tx() {
 	let previous_header = BlockHeader::default();
 	let b = new_block(vec![&tx1], &keychain, &previous_header, &key_id3.clone());
 
-	match b.validate(&BlindingFactor::zero(), &zero_commit, vc.clone()) {
+	match b.validate(&BlindingFactor::zero(), vc.clone()) {
 		Err(KernelLockHeight(height)) => {
 			assert_eq!(height, 2);
 		}

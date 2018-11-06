@@ -27,24 +27,33 @@ extern crate hyper;
 #[macro_use]
 extern crate lazy_static;
 extern crate regex;
+extern crate ring;
 extern crate serde;
 #[macro_use]
 extern crate serde_derive;
 extern crate serde_json;
 #[macro_use]
-extern crate slog;
+extern crate log;
 extern crate futures;
 extern crate http;
+extern crate hyper_rustls;
+extern crate rustls;
 extern crate tokio;
 extern crate tokio_core;
+extern crate tokio_rustls;
+extern crate tokio_tcp;
 
+pub mod auth;
 pub mod client;
 mod handlers;
 mod rest;
 mod router;
 mod types;
+mod web;
 
+pub use auth::BasicAuthMiddleware;
 pub use handlers::start_rest_apis;
 pub use rest::*;
 pub use router::*;
 pub use types::*;
+pub use web::*;

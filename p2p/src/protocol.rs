@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::cmp;
 use std::env;
 use std::fs::File;
 use std::io::{self, BufWriter};
@@ -19,6 +20,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::time;
 
+use chrono::prelude::Utc;
 use conn::{Message, MessageHandler, Response};
 use core::core::{self, hash::Hash, CompactBlock};
 use core::{global, ser};
@@ -28,7 +30,6 @@ use msg::{
 	TxHashSetArchive, TxHashSetRequest, Type,
 };
 use types::{Error, NetAdapter};
-use util::LOGGER;
 
 pub struct Protocol {
 	adapter: Arc<NetAdapter>,
@@ -50,10 +51,8 @@ impl MessageHandler for Protocol {
 		// banned peers up correctly?
 		if adapter.is_banned(self.addr.clone()) {
 			debug!(
-				LOGGER,
 				"handler: consume: peer {:?} banned, received: {:?}, dropping.",
-				self.addr,
-				msg.header.msg_type,
+				self.addr, msg.header.msg_type,
 			);
 			return Ok(None);
 		}
@@ -80,14 +79,14 @@ impl MessageHandler for Protocol {
 
 			Type::BanReason => {
 				let ban_reason: BanReason = msg.body()?;
-				error!(LOGGER, "handle_payload: BanReason {:?}", ban_reason);
+				error!("handle_payload: BanReason {:?}", ban_reason);
 				Ok(None)
 			}
 
 			Type::Transaction => {
 				debug!(
-					LOGGER,
-					"handle_payload: received tx: msg_len: {}", msg.header.msg_len
+					"handle_payload: received tx: msg_len: {}",
+					msg.header.msg_len
 				);
 				let tx: core::Transaction = msg.body()?;
 				adapter.transaction_received(tx, false);
@@ -96,8 +95,8 @@ impl MessageHandler for Protocol {
 
 			Type::StemTransaction => {
 				debug!(
-					LOGGER,
-					"handle_payload: received stem tx: msg_len: {}", msg.header.msg_len
+					"handle_payload: received stem tx: msg_len: {}",
+					msg.header.msg_len
 				);
 				let tx: core::Transaction = msg.body()?;
 				adapter.transaction_received(tx, true);
@@ -106,9 +105,10 @@ impl MessageHandler for Protocol {
 
 			Type::GetBlock => {
 				let h: Hash = msg.body()?;
-				debug!(
-					LOGGER,
-					"handle_payload: Getblock: {}, msg_len: {}", h, msg.header.msg_len,
+				trace!(
+					"handle_payload: Getblock: {}, msg_len: {}",
+					h,
+					msg.header.msg_len,
 				);
 
 				let bo = adapter.get_block(h);
@@ -120,8 +120,8 @@ impl MessageHandler for Protocol {
 
 			Type::Block => {
 				debug!(
-					LOGGER,
-					"handle_payload: received block: msg_len: {}", msg.header.msg_len
+					"handle_payload: received block: msg_len: {}",
+					msg.header.msg_len
 				);
 				let b: core::Block = msg.body()?;
 
@@ -141,8 +141,8 @@ impl MessageHandler for Protocol {
 
 			Type::CompactBlock => {
 				debug!(
-					LOGGER,
-					"handle_payload: received compact block: msg_len: {}", msg.header.msg_len
+					"handle_payload: received compact block: msg_len: {}",
+					msg.header.msg_len
 				);
 				let b: core::CompactBlock = msg.body()?;
 
@@ -184,7 +184,7 @@ impl MessageHandler for Protocol {
 					let headers: Headers = headers_streaming_body(
 						conn,
 						msg.header.msg_len,
-						8,
+						32,
 						&mut total_read,
 						&mut reserved,
 						header_size,
@@ -214,8 +214,8 @@ impl MessageHandler for Protocol {
 			Type::TxHashSetRequest => {
 				let sm_req: TxHashSetRequest = msg.body()?;
 				debug!(
-					LOGGER,
-					"handle_payload: txhashset req for {} at {}", sm_req.hash, sm_req.height
+					"handle_payload: txhashset req for {} at {}",
+					sm_req.hash, sm_req.height
 				);
 
 				let txhashset = self.adapter.txhashset_read(sm_req.hash);
@@ -240,38 +240,49 @@ impl MessageHandler for Protocol {
 			Type::TxHashSetArchive => {
 				let sm_arch: TxHashSetArchive = msg.body()?;
 				debug!(
-					LOGGER,
 					"handle_payload: txhashset archive for {} at {}. size={}",
-					sm_arch.hash,
-					sm_arch.height,
-					sm_arch.bytes,
+					sm_arch.hash, sm_arch.height, sm_arch.bytes,
 				);
 				if !self.adapter.txhashset_receive_ready() {
 					error!(
-						LOGGER,
 						"handle_payload: txhashset archive received but SyncStatus not on TxHashsetDownload",
 					);
 					return Err(Error::BadMessage);
 				}
+
+				let download_start_time = Utc::now();
+				self.adapter
+					.txhashset_download_update(download_start_time, 0, sm_arch.bytes);
+
 				let mut tmp = env::temp_dir();
 				tmp.push("txhashset.zip");
 				let mut save_txhashset_to_file = |file| -> Result<(), Error> {
 					let mut tmp_zip = BufWriter::new(File::create(file)?);
-					msg.copy_attachment(sm_arch.bytes as usize, &mut tmp_zip)?;
+					let total_size = sm_arch.bytes as usize;
+					let mut downloaded_size: usize = 0;
+					let mut request_size = cmp::min(48_000, total_size);
+					while request_size > 0 {
+						downloaded_size += msg.copy_attachment(request_size, &mut tmp_zip)?;
+						request_size = cmp::min(48_000, total_size - downloaded_size);
+						self.adapter.txhashset_download_update(
+							download_start_time,
+							downloaded_size as u64,
+							total_size as u64,
+						);
+					}
 					tmp_zip.into_inner().unwrap().sync_all()?;
 					Ok(())
 				};
 
 				if let Err(e) = save_txhashset_to_file(tmp.clone()) {
 					error!(
-						LOGGER,
-						"handle_payload: txhashset archive save to file fail. err={:?}", e
+						"handle_payload: txhashset archive save to file fail. err={:?}",
+						e
 					);
 					return Err(e);
 				}
 
 				trace!(
-					LOGGER,
 					"handle_payload: txhashset archive save to file {:?} success",
 					tmp,
 				);
@@ -282,18 +293,15 @@ impl MessageHandler for Protocol {
 					.txhashset_write(sm_arch.hash, tmp_zip, self.addr);
 
 				debug!(
-					LOGGER,
 					"handle_payload: txhashset archive for {} at {}, DONE. Data Ok: {}",
-					sm_arch.hash,
-					sm_arch.height,
-					res
+					sm_arch.hash, sm_arch.height, res
 				);
 
 				Ok(None)
 			}
 
 			_ => {
-				debug!(LOGGER, "unknown message type {:?}", msg.header.msg_type);
+				debug!("unknown message type {:?}", msg.header.msg_type);
 				Ok(None)
 			}
 		}
@@ -315,25 +323,21 @@ fn headers_header_size(conn: &mut TcpStream, msg_len: u64) -> Result<u64, Error>
 	}
 	let average_header_size = (msg_len - 2) / total_headers;
 
-	// support size of Cuckoo: from Cuckoo 30 to Cuckoo 36, with version 2
+	// support size of Cuck(at)oo: from Cuck(at)oo 29 to Cuck(at)oo 35, with version 2
 	// having slightly larger headers
-	let minimum_size = core::serialized_size_of_header(1, global::min_sizeshift());
-	let maximum_size = core::serialized_size_of_header(2, global::min_sizeshift() + 6);
-	if average_header_size < minimum_size as u64 || average_header_size > maximum_size as u64 {
+	let min_size = core::serialized_size_of_header(1, global::min_edge_bits());
+	let max_size = min_size + 6;
+	if average_header_size < min_size as u64 || average_header_size > max_size as u64 {
 		debug!(
-			LOGGER,
 			"headers_header_size - size of Vec: {}, average_header_size: {}, min: {}, max: {}",
-			total_headers,
-			average_header_size,
-			minimum_size,
-			maximum_size,
+			total_headers, average_header_size, min_size, max_size,
 		);
 		return Err(Error::Connection(io::Error::new(
 			io::ErrorKind::InvalidData,
 			"headers_header_size",
 		)));
 	}
-	return Ok(maximum_size as u64);
+	return Ok(max_size as u64);
 }
 
 /// Read the Headers streaming body from the underlying connection

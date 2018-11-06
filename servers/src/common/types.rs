@@ -13,18 +13,18 @@
 // limitations under the License.
 
 //! Server types
-
 use std::convert::From;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use util::RwLock;
 
 use api;
 use chain;
+use chrono::prelude::{DateTime, Utc};
 use core::global::ChainTypes;
 use core::{core, pow};
 use p2p;
 use pool;
 use store;
-use util::LOGGER;
 use wallet;
 
 /// Error type wrapping underlying module errors.
@@ -43,7 +43,9 @@ pub enum Error {
 	/// Error originating from wallet API.
 	Wallet(wallet::Error),
 	/// Error originating from the cuckoo miner
-	Cuckoo(pow::cuckoo::Error),
+	Cuckoo(pow::Error),
+	/// Error originating from the transaction pool.
+	Pool(pool::PoolError),
 }
 
 impl From<core::block::Error> for Error {
@@ -63,8 +65,8 @@ impl From<p2p::Error> for Error {
 	}
 }
 
-impl From<pow::cuckoo::Error> for Error {
-	fn from(e: pow::cuckoo::Error) -> Error {
+impl From<pow::Error> for Error {
+	fn from(e: pow::Error) -> Error {
 		Error::Cuckoo(e)
 	}
 }
@@ -84,6 +86,12 @@ impl From<api::Error> for Error {
 impl From<wallet::Error> for Error {
 	fn from(e: wallet::Error) -> Error {
 		Error::Wallet(e)
+	}
+}
+
+impl From<pool::PoolError> for Error {
+	fn from(e: pool::PoolError) -> Error {
+		Error::Pool(e)
 	}
 }
 
@@ -112,6 +120,9 @@ pub struct ServerConfig {
 
 	/// Network address for the Rest API HTTP server.
 	pub api_http_addr: String,
+
+	/// Location of secret for basic auth on Rest API HTTP server.
+	pub api_secret_path: Option<String>,
 
 	/// Setup the server for tests, testnet or mainnet
 	#[serde(default)]
@@ -162,6 +173,7 @@ impl Default for ServerConfig {
 		ServerConfig {
 			db_root: "grin_chain".to_string(),
 			api_http_addr: "127.0.0.1:13413".to_string(),
+			api_secret_path: Some(".api_secret".to_string()),
 			p2p_config: p2p::P2PConfig::default(),
 			dandelion_config: pool::DandelionConfig::default(),
 			stratum_mining_config: Some(StratumServerConfig::default()),
@@ -224,13 +236,20 @@ pub enum SyncStatus {
 	Initial,
 	/// Not syncing
 	NoSync,
+	/// Not enough peers to do anything yet, boolean indicates whether
+	/// we should wait at all or ignore and start ASAP
+	AwaitingPeers(bool),
 	/// Downloading block headers
 	HeaderSync {
 		current_height: u64,
 		highest_height: u64,
 	},
 	/// Downloading the various txhashsets
-	TxHashsetDownload,
+	TxHashsetDownload {
+		start_time: DateTime<Utc>,
+		downloaded_size: u64,
+		total_size: u64,
+	},
 	/// Setting up before validation
 	TxHashsetSetup,
 	/// Validating the full state
@@ -267,12 +286,12 @@ impl SyncState {
 	/// Whether the current state matches any active syncing operation.
 	/// Note: This includes our "initial" state.
 	pub fn is_syncing(&self) -> bool {
-		*self.current.read().unwrap() != SyncStatus::NoSync
+		*self.current.read() != SyncStatus::NoSync
 	}
 
 	/// Current syncing status
 	pub fn status(&self) -> SyncStatus {
-		*self.current.read().unwrap()
+		*self.current.read()
 	}
 
 	/// Update the syncing status
@@ -281,19 +300,27 @@ impl SyncState {
 			return;
 		}
 
-		let mut status = self.current.write().unwrap();
+		let mut status = self.current.write();
 
-		debug!(
-			LOGGER,
-			"sync_state: sync_status: {:?} -> {:?}", *status, new_status,
-		);
+		debug!("sync_state: sync_status: {:?} -> {:?}", *status, new_status,);
 
 		*status = new_status;
 	}
 
+	/// Update txhashset downloading progress
+	pub fn update_txhashset_download(&self, new_status: SyncStatus) -> bool {
+		if let SyncStatus::TxHashsetDownload { .. } = new_status {
+			let mut status = self.current.write();
+			*status = new_status;
+			true
+		} else {
+			false
+		}
+	}
+
 	/// Communicate sync error
 	pub fn set_sync_error(&self, error: Error) {
-		*self.sync_error.write().unwrap() = Some(error);
+		*self.sync_error.write() = Some(error);
 	}
 
 	/// Get sync error
@@ -303,7 +330,7 @@ impl SyncState {
 
 	/// Clear sync error
 	pub fn clear_sync_error(&self) {
-		*self.sync_error.write().unwrap() = None;
+		*self.sync_error.write() = None;
 	}
 }
 
@@ -313,7 +340,7 @@ impl chain::TxHashsetWriteStatus for SyncState {
 	}
 
 	fn on_validation(&self, vkernels: u64, vkernel_total: u64, vrproofs: u64, vrproof_total: u64) {
-		let mut status = self.current.write().unwrap();
+		let mut status = self.current.write();
 		match *status {
 			SyncStatus::TxHashsetValidation {
 				kernels,

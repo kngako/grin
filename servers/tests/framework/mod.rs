@@ -25,10 +25,12 @@ extern crate blake2_rfc as blake2;
 
 use std::default::Default;
 use std::ops::Deref;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::{fs, thread, time};
+use util::Mutex;
 
-use wallet::{FileWallet, HTTPWalletClient, WalletConfig};
+use framework::keychain::Keychain;
+use wallet::{HTTPWalletClient, LMDBBackend, WalletConfig};
 
 /// Just removes all results from previous runs
 pub fn clean_all_output(test_name_dir: &str) {
@@ -188,6 +190,7 @@ impl LocalServerContainer {
 
 		let s = servers::Server::new(servers::ServerConfig {
 			api_http_addr: api_addr,
+			api_secret_path: None,
 			db_root: format!("{}/.grin", self.working_dir),
 			p2p_config: p2p::P2PConfig {
 				port: self.config.p2p_server_port,
@@ -220,7 +223,7 @@ impl LocalServerContainer {
 				"starting test Miner on port {}",
 				self.config.p2p_server_port
 			);
-			s.start_test_miner(wallet_url);
+			s.start_test_miner(wallet_url, s.stop.clone());
 		}
 
 		for p in &mut self.peer_list {
@@ -262,14 +265,14 @@ impl LocalServerContainer {
 		let _ = fs::create_dir_all(self.wallet_config.clone().data_file_dir);
 		let r = wallet::WalletSeed::init_file(&self.wallet_config);
 
-		let client = HTTPWalletClient::new(&self.wallet_config.check_node_api_http_addr);
+		let client = HTTPWalletClient::new(&self.wallet_config.check_node_api_http_addr, None);
 
-		if let Err(e) = r {
+		if let Err(_e) = r {
 			//panic!("Error initializing wallet seed: {}", e);
 		}
 
-		let wallet: FileWallet<HTTPWalletClient, keychain::ExtKeychain> =
-			FileWallet::new(self.wallet_config.clone(), "", client).unwrap_or_else(|e| {
+		let wallet: LMDBBackend<HTTPWalletClient, keychain::ExtKeychain> =
+			LMDBBackend::new(self.wallet_config.clone(), "", client).unwrap_or_else(|e| {
 				panic!(
 					"Error creating wallet: {:?} Config: {:?}",
 					e, self.wallet_config
@@ -279,6 +282,7 @@ impl LocalServerContainer {
 		wallet::controller::foreign_listener(
 			Box::new(wallet),
 			&self.wallet_config.api_listen_addr(),
+			None,
 		).unwrap_or_else(|e| {
 			panic!(
 				"Error creating wallet listener: {:?} Config: {:?}",
@@ -304,12 +308,13 @@ impl LocalServerContainer {
 		let keychain: keychain::ExtKeychain = wallet_seed
 			.derive_keychain("")
 			.expect("Failed to derive keychain from seed file and passphrase.");
-		let client = HTTPWalletClient::new(&config.check_node_api_http_addr);
-		let mut wallet = FileWallet::new(config.clone(), "", client)
+		let client = HTTPWalletClient::new(&config.check_node_api_http_addr, None);
+		let mut wallet = LMDBBackend::new(config.clone(), "", client)
 			.unwrap_or_else(|e| panic!("Error creating wallet: {:?} Config: {:?}", e, config));
 		wallet.keychain = Some(keychain);
-		let _ = wallet::libwallet::internal::updater::refresh_outputs(&mut wallet);
-		wallet::libwallet::internal::updater::retrieve_info(&mut wallet).unwrap()
+		let parent_id = keychain::ExtKeychain::derive_key_id(2, 0, 0, 0, 0);
+		let _ = wallet::libwallet::internal::updater::refresh_outputs(&mut wallet, &parent_id);
+		wallet::libwallet::internal::updater::retrieve_info(&mut wallet, &parent_id).unwrap()
 	}
 
 	pub fn send_amount_to(
@@ -318,7 +323,7 @@ impl LocalServerContainer {
 		minimum_confirmations: u64,
 		selection_strategy: &str,
 		dest: &str,
-		fluff: bool,
+		_fluff: bool,
 	) {
 		let amount = core::core::amount_from_hr_string(amount)
 			.expect("Could not parse amount as a number with optional decimal point.");
@@ -330,12 +335,12 @@ impl LocalServerContainer {
 			.derive_keychain("")
 			.expect("Failed to derive keychain from seed file and passphrase.");
 
-		let client = HTTPWalletClient::new(&config.check_node_api_http_addr);
+		let client = HTTPWalletClient::new(&config.check_node_api_http_addr, None);
 
 		let max_outputs = 500;
 		let change_outputs = 1;
 
-		let mut wallet = FileWallet::new(config.clone(), "", client)
+		let mut wallet = LMDBBackend::new(config.clone(), "", client)
 			.unwrap_or_else(|e| panic!("Error creating wallet: {:?} Config: {:?}", e, config));
 		wallet.keychain = Some(keychain);
 		let _ =
@@ -528,7 +533,7 @@ impl LocalServerContainerPool {
 					thread::sleep(time::Duration::from_millis(2000));
 				}
 				let server_ref = s.run_server(run_length);
-				return_container_ref.lock().unwrap().push(server_ref);
+				return_container_ref.lock().push(server_ref);
 			});
 			// Not a big fan of sleeping hack here, but there appears to be a
 			// concurrency issue when creating files in rocksdb that causes
@@ -571,7 +576,7 @@ impl LocalServerContainerPool {
 }
 
 pub fn stop_all_servers(servers: Arc<Mutex<Vec<servers::Server>>>) {
-	let locked_servs = servers.lock().unwrap();
+	let locked_servs = servers.lock();
 	for s in locked_servs.deref() {
 		s.stop();
 	}
@@ -581,6 +586,7 @@ pub fn stop_all_servers(servers: Arc<Mutex<Vec<servers::Server>>>) {
 pub fn config(n: u16, test_name_dir: &str, seed_n: u16) -> servers::ServerConfig {
 	servers::ServerConfig {
 		api_http_addr: format!("127.0.0.1:{}", 20000 + n),
+		api_secret_path: None,
 		db_root: format!("target/tmp/{}/grin-sync-{}", test_name_dir, n),
 		p2p_config: p2p::P2PConfig {
 			port: 10000 + n,

@@ -30,7 +30,6 @@ use util::{kernel_sig_msg, secp};
 use core::core::{Input, Output, OutputFeatures, Transaction, TxKernel};
 use keychain::{self, BlindSum, BlindingFactor, Identifier, Keychain};
 use libtx::{aggsig, proof};
-use util::LOGGER;
 
 /// Context information available to transaction combinators.
 pub struct Context<'a, K: 'a>
@@ -55,7 +54,7 @@ where
 		move |build, (tx, kern, sum)| -> (Transaction, TxKernel, BlindSum) {
 			let commit = build.keychain.commit(value, &key_id).unwrap();
 			let input = Input::new(features, commit);
-			(tx.with_input(input), kern, sum.sub_key_id(key_id.clone()))
+			(tx.with_input(input), kern, sum.sub_key_id(key_id.to_path()))
 		},
 	)
 }
@@ -67,8 +66,8 @@ where
 	K: Keychain,
 {
 	debug!(
-		LOGGER,
-		"Building input (spending regular output): {}, {}", value, key_id
+		"Building input (spending regular output): {}, {}",
+		value, key_id
 	);
 	build_input(value, OutputFeatures::DEFAULT_OUTPUT, key_id)
 }
@@ -78,10 +77,7 @@ pub fn coinbase_input<K>(value: u64, key_id: Identifier) -> Box<Append<K>>
 where
 	K: Keychain,
 {
-	debug!(
-		LOGGER,
-		"Building input (spending coinbase): {}, {}", value, key_id
-	);
+	debug!("Building input (spending coinbase): {}, {}", value, key_id);
 	build_input(value, OutputFeatures::COINBASE_OUTPUT, key_id)
 }
 
@@ -95,7 +91,7 @@ where
 		move |build, (tx, kern, sum)| -> (Transaction, TxKernel, BlindSum) {
 			let commit = build.keychain.commit(value, &key_id).unwrap();
 
-			debug!(LOGGER, "Building output: {}, {:?}", value, commit);
+			debug!("Building output: {}, {:?}", value, commit);
 
 			let rproof = proof::create(build.keychain, value, &key_id, commit, None).unwrap();
 
@@ -106,7 +102,7 @@ where
 					proof: rproof,
 				}),
 				kern,
-				sum.add_key_id(key_id.clone()),
+				sum.add_key_id(key_id.to_path()),
 			)
 		},
 	)
@@ -236,7 +232,9 @@ where
 	// Generate kernel excess and excess_sig using the split key k1.
 	let skey = k1.secret_key(&keychain.secp())?;
 	kern.excess = ctx.keychain.secp().commit(0, skey)?;
-	kern.excess_sig = aggsig::sign_with_blinding(&keychain.secp(), &msg, &k1).unwrap();
+	let pubkey = &kern.excess.to_pubkey(&keychain.secp())?;
+	kern.excess_sig =
+		aggsig::sign_with_blinding(&keychain.secp(), &msg, &k1, Some(&pubkey)).unwrap();
 
 	// Store the kernel offset (k2) on the tx.
 	// Commitments will sum correctly when accounting for the offset.
@@ -253,11 +251,12 @@ where
 // Just a simple test, most exhaustive tests in the core mod.rs.
 #[cfg(test)]
 mod test {
-	use std::sync::{Arc, RwLock};
+	use std::sync::Arc;
+	use util::RwLock;
 
 	use super::*;
 	use core::core::verifier_cache::{LruVerifierCache, VerifierCache};
-	use keychain::ExtKeychain;
+	use keychain::{ExtKeychain, ExtKeychainPath};
 
 	fn verifier_cache() -> Arc<RwLock<VerifierCache>> {
 		Arc::new(RwLock::new(LruVerifierCache::new()))
@@ -266,9 +265,9 @@ mod test {
 	#[test]
 	fn blind_simple_tx() {
 		let keychain = ExtKeychain::from_random_seed().unwrap();
-		let key_id1 = keychain.derive_key_id(1).unwrap();
-		let key_id2 = keychain.derive_key_id(2).unwrap();
-		let key_id3 = keychain.derive_key_id(3).unwrap();
+		let key_id1 = ExtKeychainPath::new(1, 1, 0, 0, 0).to_identifier();
+		let key_id2 = ExtKeychainPath::new(1, 2, 0, 0, 0).to_identifier();
+		let key_id3 = ExtKeychainPath::new(1, 3, 0, 0, 0).to_identifier();
 
 		let vc = verifier_cache();
 
@@ -288,9 +287,9 @@ mod test {
 	#[test]
 	fn blind_simple_tx_with_offset() {
 		let keychain = ExtKeychain::from_random_seed().unwrap();
-		let key_id1 = keychain.derive_key_id(1).unwrap();
-		let key_id2 = keychain.derive_key_id(2).unwrap();
-		let key_id3 = keychain.derive_key_id(3).unwrap();
+		let key_id1 = ExtKeychainPath::new(1, 1, 0, 0, 0).to_identifier();
+		let key_id2 = ExtKeychainPath::new(1, 2, 0, 0, 0).to_identifier();
+		let key_id3 = ExtKeychainPath::new(1, 3, 0, 0, 0).to_identifier();
 
 		let vc = verifier_cache();
 
@@ -310,8 +309,8 @@ mod test {
 	#[test]
 	fn blind_simpler_tx() {
 		let keychain = ExtKeychain::from_random_seed().unwrap();
-		let key_id1 = keychain.derive_key_id(1).unwrap();
-		let key_id2 = keychain.derive_key_id(2).unwrap();
+		let key_id1 = ExtKeychainPath::new(1, 1, 0, 0, 0).to_identifier();
+		let key_id2 = ExtKeychainPath::new(1, 2, 0, 0, 0).to_identifier();
 
 		let vc = verifier_cache();
 

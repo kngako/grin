@@ -54,10 +54,18 @@ pub fn option_to_not_found<T>(res: Result<Option<T>, Error>, field_name: &str) -
 	}
 }
 
-/// Create a new LMDB env under the provided directory to spawn various
-/// databases from.
+/// Create a new LMDB env under the provided directory.
+/// By default creates an environment named "lmdb".
+/// Be aware of transactional semantics in lmdb
+/// (transactions are per environment, not per database).
 pub fn new_env(path: String) -> lmdb::Environment {
-	let full_path = path + "/lmdb";
+	new_named_env(path, "lmdb".into())
+}
+
+/// TODO - We probably need more flexibility here, 500GB probably too big for peers...
+/// Create a new LMDB env under the provided directory with the provided name.
+pub fn new_named_env(path: String, name: String) -> lmdb::Environment {
+	let full_path = [path, name].join("/");
 	fs::create_dir_all(&full_path).unwrap();
 	unsafe {
 		let mut env_builder = lmdb::EnvBuilder::new().unwrap();
@@ -140,11 +148,11 @@ impl Store {
 	/// Produces an iterator of `Readable` types moving forward from the
 	/// provided key.
 	pub fn iter<T: ser::Readable>(&self, from: &[u8]) -> Result<SerIterator<T>, Error> {
-		let txn = Arc::new(lmdb::ReadTransaction::new(self.env.clone())?);
-		let cursor = Arc::new(txn.cursor(self.db.clone()).unwrap());
+		let tx = Arc::new(lmdb::ReadTransaction::new(self.env.clone())?);
+		let cursor = Arc::new(tx.cursor(self.db.clone()).unwrap());
 		Ok(SerIterator {
-			tx: txn,
-			cursor: cursor,
+			tx,
+			cursor,
 			seek: false,
 			prefix: from.to_vec(),
 			_marker: marker::PhantomData,
@@ -189,6 +197,11 @@ impl<'a> Batch<'a> {
 	/// gets a value from the db, provided its key
 	pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
 		self.store.get(key)
+	}
+
+	/// Whether the provided key exists
+	pub fn exists(&self, key: &[u8]) -> Result<bool, Error> {
+		self.store.exists(key)
 	}
 
 	/// Produces an iterator of `Readable` types moving forward from the

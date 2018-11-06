@@ -15,12 +15,13 @@
 use std::fs::File;
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 use std::{io, thread};
 
 use lmdb;
 
+use chrono::prelude::{DateTime, Utc};
 use core::core;
 use core::core::hash::Hash;
 use core::pow::Difficulty;
@@ -29,7 +30,6 @@ use peer::Peer;
 use peers::Peers;
 use store::PeerStore;
 use types::{Capabilities, ChainAdapter, Error, NetAdapter, P2PConfig, TxHashSetRead};
-use util::LOGGER;
 
 /// P2P server implementation, handling bootstrapping to find and connect to
 /// peers, receiving connections from other peers and keep track of all of them.
@@ -41,43 +41,17 @@ pub struct Server {
 	stop: Arc<AtomicBool>,
 }
 
-unsafe impl Sync for Server {}
-unsafe impl Send for Server {}
-
 // TODO TLS
 impl Server {
 	/// Creates a new idle p2p server with no peers
 	pub fn new(
 		db_env: Arc<lmdb::Environment>,
-		mut capab: Capabilities,
+		capab: Capabilities,
 		config: P2PConfig,
 		adapter: Arc<ChainAdapter>,
 		genesis: Hash,
 		stop: Arc<AtomicBool>,
-		archive_mode: bool,
-		block_1_hash: Option<Hash>,
 	) -> Result<Server, Error> {
-		// In the case of an archive node, check that we do have the first block.
-		// In case of first sync we do not perform this check.
-		if archive_mode && adapter.total_height() > 0 {
-			// Check that we have block 1
-			match block_1_hash {
-				Some(hash) => match adapter.get_block(hash) {
-					Some(_) => debug!(LOGGER, "Full block 1 found, archive capabilities confirmed"),
-					None => {
-						debug!(
-							LOGGER,
-							"Full block 1 not found, archive capabilities disabled"
-						);
-						capab.remove(Capabilities::FULL_HIST);
-					}
-				},
-				None => {
-					debug!(LOGGER, "Block 1 not found, archive capabilities disabled");
-					capab.remove(Capabilities::FULL_HIST);
-				}
-			}
-		}
 		Ok(Server {
 			config: config.clone(),
 			capabilities: capab,
@@ -90,21 +64,6 @@ impl Server {
 	/// Starts a new TCP server and listen to incoming connections. This is a
 	/// blocking call until the TCP server stops.
 	pub fn listen(&self) -> Result<(), Error> {
-		// start peer monitoring thread
-		let peers_inner = self.peers.clone();
-		let stop = self.stop.clone();
-		let _ = thread::Builder::new()
-			.name("p2p-monitor".to_string())
-			.spawn(move || loop {
-				let total_diff = peers_inner.total_difficulty();
-				let total_height = peers_inner.total_height();
-				peers_inner.check_all(total_diff, total_height);
-				thread::sleep(Duration::from_secs(10));
-				if stop.load(Ordering::Relaxed) {
-					break;
-				}
-			});
-
 		// start TCP listener and handle incoming connections
 		let addr = SocketAddr::new(self.config.host, self.config.port);
 		let listener = TcpListener::bind(addr)?;
@@ -116,12 +75,7 @@ impl Server {
 				Ok((stream, peer_addr)) => {
 					if !self.check_banned(&stream) {
 						if let Err(e) = self.handle_new_peer(stream) {
-							warn!(
-								LOGGER,
-								"Error accepting peer {}: {:?}",
-								peer_addr.to_string(),
-								e
-							);
+							warn!("Error accepting peer {}: {:?}", peer_addr.to_string(), e);
 						}
 					}
 				}
@@ -129,7 +83,7 @@ impl Server {
 					// nothing to do, will retry in next iteration
 				}
 				Err(e) => {
-					warn!(LOGGER, "Couldn't establish new client connection: {:?}", e);
+					warn!("Couldn't establish new client connection: {:?}", e);
 				}
 			}
 			if self.stop.load(Ordering::Relaxed) {
@@ -142,12 +96,9 @@ impl Server {
 
 	/// Asks the server to connect to a new peer. Directly returns the peer if
 	/// we're already connected to the provided address.
-	pub fn connect(&self, addr: &SocketAddr) -> Result<Arc<RwLock<Peer>>, Error> {
+	pub fn connect(&self, addr: &SocketAddr) -> Result<Arc<Peer>, Error> {
 		if Peer::is_denied(&self.config, &addr) {
-			debug!(
-				LOGGER,
-				"connect_peer: peer {} denied, not connecting.", addr
-			);
+			debug!("connect_peer: peer {} denied, not connecting.", addr);
 			return Err(Error::ConnectionClose);
 		}
 
@@ -162,12 +113,11 @@ impl Server {
 
 		if let Some(p) = self.peers.get_connected_peer(addr) {
 			// if we're already connected to the addr, just return the peer
-			trace!(LOGGER, "connect_peer: already connected {}", addr);
+			trace!("connect_peer: already connected {}", addr);
 			return Ok(p);
 		}
 
 		trace!(
-			LOGGER,
 			"connect_peer: on {}:{}. connecting to {}",
 			self.config.host,
 			self.config.port,
@@ -178,7 +128,7 @@ impl Server {
 				let addr = SocketAddr::new(self.config.host, self.config.port);
 				let total_diff = self.peers.total_difficulty();
 
-				let peer = Peer::connect(
+				let mut peer = Peer::connect(
 					&mut stream,
 					self.capabilities,
 					total_diff,
@@ -186,21 +136,15 @@ impl Server {
 					&self.handshake,
 					self.peers.clone(),
 				)?;
-				let added = self.peers.add_connected(peer)?;
-				{
-					let mut peer = added.write().unwrap();
-					peer.start(stream);
-				}
-				Ok(added)
+				peer.start(stream);
+				let peer = Arc::new(peer);
+				self.peers.add_connected(peer.clone())?;
+				Ok(peer)
 			}
 			Err(e) => {
 				debug!(
-					LOGGER,
 					"connect_peer: on {}:{}. Could not connect to {}: {:?}",
-					self.config.host,
-					self.config.port,
-					addr,
-					e
+					self.config.host, self.config.port, addr, e
 				);
 				Err(Error::Connection(e))
 			}
@@ -211,16 +155,15 @@ impl Server {
 		let total_diff = self.peers.total_difficulty();
 
 		// accept the peer and add it to the server map
-		let peer = Peer::accept(
+		let mut peer = Peer::accept(
 			&mut stream,
 			self.capabilities,
 			total_diff,
 			&self.handshake,
 			self.peers.clone(),
 		)?;
-		let added = self.peers.add_connected(peer)?;
-		let mut peer = added.write().unwrap();
 		peer.start(stream);
+		self.peers.add_connected(Arc::new(peer))?;
 		Ok(())
 	}
 
@@ -228,9 +171,9 @@ impl Server {
 		// peer has been banned, go away!
 		if let Ok(peer_addr) = stream.peer_addr() {
 			if self.peers.is_banned(peer_addr) {
-				debug!(LOGGER, "Peer {} banned, refusing connection.", peer_addr);
+				debug!("Peer {} banned, refusing connection.", peer_addr);
 				if let Err(e) = stream.shutdown(Shutdown::Both) {
-					debug!(LOGGER, "Error shutting down conn: {:?}", e);
+					debug!("Error shutting down conn: {:?}", e);
 				}
 				return true;
 			}
@@ -249,7 +192,7 @@ pub struct DummyAdapter {}
 
 impl ChainAdapter for DummyAdapter {
 	fn total_difficulty(&self) -> Difficulty {
-		Difficulty::one()
+		Difficulty::min()
 	}
 	fn total_height(&self) -> u64 {
 		0
@@ -282,6 +225,15 @@ impl ChainAdapter for DummyAdapter {
 	}
 
 	fn txhashset_write(&self, _h: Hash, _txhashset_data: File, _peer_addr: SocketAddr) -> bool {
+		false
+	}
+
+	fn txhashset_download_update(
+		&self,
+		_start_time: DateTime<Utc>,
+		_downloaded_size: u64,
+		_total_size: u64,
+	) -> bool {
 		false
 	}
 }

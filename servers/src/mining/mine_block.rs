@@ -16,10 +16,11 @@
 //! them into a block and returns it.
 
 use chrono::prelude::{DateTime, NaiveDateTime, Utc};
-use rand::{self, Rng};
-use std::sync::{Arc, RwLock};
+use rand::{thread_rng, Rng};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use util::RwLock;
 
 use chain;
 use common::types::Error;
@@ -27,7 +28,7 @@ use core::core::verifier_cache::VerifierCache;
 use core::{consensus, core, ser};
 use keychain::{ExtKeychain, Identifier, Keychain};
 use pool;
-use util::{self, LOGGER};
+use util;
 use wallet::{self, BlockFees};
 
 // Ensure a block suitable for mining is built and returned
@@ -54,24 +55,22 @@ pub fn get_block(
 			self::Error::Chain(c) => match c.kind() {
 				chain::ErrorKind::DuplicateCommitment(_) => {
 					debug!(
-						LOGGER,
 						"Duplicate commit for potential coinbase detected. Trying next derivation."
 					);
 				}
 				_ => {
-					error!(LOGGER, "Chain Error: {}", c);
+					error!("Chain Error: {}", c);
 				}
 			},
 			self::Error::Wallet(_) => {
 				error!(
-					LOGGER,
 					"Error building new block: Can't connect to wallet listener at {:?}; will retry",
 					wallet_listener_url.as_ref().unwrap()
 				);
 				thread::sleep(Duration::from_secs(wallet_retry_interval));
 			}
 			ae => {
-				warn!(LOGGER, "Error building new block: {:?}. Retrying.", ae);
+				warn!("Error building new block: {:?}. Retrying.", ae);
 			}
 		}
 		thread::sleep(Duration::from_millis(100));
@@ -95,21 +94,21 @@ fn build_block(
 	key_id: Option<Identifier>,
 	wallet_listener_url: Option<String>,
 ) -> Result<(core::Block, BlockFees), Error> {
-	// prepare the block header timestamp
 	let head = chain.head_header()?;
 
+	// prepare the block header timestamp
 	let mut now_sec = Utc::now().timestamp();
 	let head_sec = head.timestamp.timestamp();
 	if now_sec <= head_sec {
 		now_sec = head_sec + 1;
 	}
 
-	// get the difficulty our block should be at
-	let diff_iter = chain.difficulty_iter();
-	let difficulty = consensus::next_difficulty(diff_iter).unwrap();
+	// Determine the difficulty our block should be at.
+	// Note: do not keep the difficulty_iter in scope (it has an active batch).
+	let difficulty = consensus::next_difficulty(head.height + 1, chain.difficulty_iter());
 
 	// extract current transaction from the pool
-	let txs = tx_pool.read().unwrap().prepare_mineable_transactions();
+	let txs = tx_pool.read().prepare_mineable_transactions()?;
 
 	// build the coinbase and the block itself
 	let fees = txs.iter().map(|tx| tx.fee()).sum();
@@ -121,29 +120,17 @@ fn build_block(
 	};
 
 	let (output, kernel, block_fees) = get_coinbase(wallet_listener_url, block_fees)?;
-	let mut b = core::Block::with_reward(
-		&head,
-		txs,
-		output,
-		kernel,
-		difficulty.clone(),
-		verifier_cache.clone(),
-	)?;
+	let mut b = core::Block::with_reward(&head, txs, output, kernel, difficulty.difficulty)?;
 
 	// making sure we're not spending time mining a useless block
-	b.validate(
-		&head.total_kernel_offset,
-		&head.total_kernel_sum,
-		verifier_cache,
-	)?;
+	b.validate(&head.total_kernel_offset, verifier_cache)?;
 
-	let mut rng = rand::OsRng::new().unwrap();
-	b.header.pow.nonce = rng.gen();
-	b.header.timestamp = DateTime::<Utc>::from_utc(NaiveDateTime::from_timestamp(now_sec, 0), Utc);;
+	b.header.pow.nonce = thread_rng().gen();
+	b.header.pow.secondary_scaling = difficulty.secondary_scaling;
+	b.header.timestamp = DateTime::<Utc>::from_utc(NaiveDateTime::from_timestamp(now_sec, 0), Utc);
 
 	let b_difficulty = (b.header.total_difficulty() - head.total_difficulty()).to_num();
 	debug!(
-		LOGGER,
 		"Built new block with {} inputs and {} outputs, network difficulty: {}, cumulative difficulty {}",
 		b.inputs().len(),
 		b.outputs().len(),
@@ -152,7 +139,7 @@ fn build_block(
 	);
 
 	// Now set txhashset roots and sizes on the header of the block being built.
-	let roots_result = chain.set_txhashset_roots(&mut b, false);
+	let roots_result = chain.set_txhashset_roots(&mut b);
 
 	match roots_result {
 		Ok(_) => Ok((b, block_fees)),
@@ -168,10 +155,7 @@ fn build_block(
 
 				//Some other issue, possibly duplicate kernel
 				_ => {
-					error!(
-						LOGGER,
-						"Error setting txhashset root to build a block: {:?}", e
-					);
+					error!("Error setting txhashset root to build a block: {:?}", e);
 					Err(Error::Chain(
 						chain::ErrorKind::Other(format!("{:?}", e)).into(),
 					))
@@ -185,9 +169,9 @@ fn build_block(
 /// Probably only want to do this when testing.
 ///
 fn burn_reward(block_fees: BlockFees) -> Result<(core::Output, core::TxKernel, BlockFees), Error> {
-	warn!(LOGGER, "Burning block fees: {:?}", block_fees);
+	warn!("Burning block fees: {:?}", block_fees);
 	let keychain = ExtKeychain::from_random_seed().unwrap();
-	let key_id = keychain.derive_key_id(1).unwrap();
+	let key_id = ExtKeychain::derive_key_id(1, 1, 0, 0, 0);
 	let (out, kernel) =
 		wallet::libtx::reward::output(&keychain, &key_id, block_fees.fees, block_fees.height)
 			.unwrap();
@@ -218,7 +202,7 @@ fn get_coinbase(
 				..block_fees
 			};
 
-			debug!(LOGGER, "get_coinbase: {:?}", block_fees);
+			debug!("get_coinbase: {:?}", block_fees);
 			return Ok((output, kernel, block_fees));
 		}
 	}

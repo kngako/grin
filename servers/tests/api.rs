@@ -13,7 +13,7 @@
 // limitations under the License.
 
 #[macro_use]
-extern crate slog;
+extern crate log;
 
 extern crate grin_api as api;
 extern crate grin_chain as chain;
@@ -26,25 +26,27 @@ extern crate grin_wallet as wallet;
 
 mod framework;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::{thread, time};
+use util::Mutex;
 
 use core::global::{self, ChainTypes};
 
 use framework::{LocalServerContainer, LocalServerContainerConfig};
-use util::{init_test_logger, LOGGER};
+use util::init_test_logger;
 
 #[test]
 fn simple_server_wallet() {
 	init_test_logger();
-	info!(LOGGER, "starting simple_server_wallet");
+	info!("starting simple_server_wallet");
 	let test_name_dir = "test_servers";
 	core::global::set_mining_mode(core::global::ChainTypes::AutomatedTesting);
-	framework::clean_all_output(test_name_dir);
 
 	// Run a separate coinbase wallet for coinbase transactions
+	let coinbase_dir = "coinbase_wallet_api";
+	framework::clean_all_output(coinbase_dir);
 	let mut coinbase_config = LocalServerContainerConfig::default();
-	coinbase_config.name = String::from("coinbase_wallet_api");
+	coinbase_config.name = String::from(coinbase_dir);
 	coinbase_config.wallet_validating_node_url = String::from("http://127.0.0.1:40001");
 	coinbase_config.wallet_port = 50002;
 	let coinbase_wallet = Arc::new(Mutex::new(
@@ -52,15 +54,17 @@ fn simple_server_wallet() {
 	));
 
 	let _ = thread::spawn(move || {
-		let mut w = coinbase_wallet.lock().unwrap();
+		let mut w = coinbase_wallet.lock();
 		w.run_wallet(0);
 	});
 
 	// Wait for the wallet to start
 	thread::sleep(time::Duration::from_millis(1000));
 
+	let api_server_one_dir = "api_server_one";
+	framework::clean_all_output(api_server_one_dir);
 	let mut server_config = LocalServerContainerConfig::default();
-	server_config.name = String::from("api_server_one");
+	server_config.name = String::from(api_server_one_dir);
 	server_config.p2p_server_port = 40000;
 	server_config.api_server_port = 40001;
 	server_config.start_miner = true;
@@ -79,11 +83,11 @@ fn simple_server_wallet() {
 	let base_addr = server_config.base_addr;
 	let api_server_port = server_config.api_server_port;
 
-	warn!(LOGGER, "Testing chain handler");
+	warn!("Testing chain handler");
 	let tip = get_tip(&base_addr, api_server_port);
 	assert!(tip.is_ok());
 
-	warn!(LOGGER, "Testing status handler");
+	warn!("Testing status handler");
 	let status = get_status(&base_addr, api_server_port);
 	assert!(status.is_ok());
 
@@ -94,7 +98,7 @@ fn simple_server_wallet() {
 		current_tip = get_tip(&base_addr, api_server_port).unwrap();
 	}
 
-	warn!(LOGGER, "Testing block handler");
+	warn!("Testing block handler");
 	let last_block_by_height = get_block_by_height(&base_addr, api_server_port, current_tip.height);
 	assert!(last_block_by_height.is_ok());
 	let last_block_by_height_compact =
@@ -108,7 +112,7 @@ fn simple_server_wallet() {
 		get_block_by_hash_compact(&base_addr, api_server_port, &block_hash);
 	assert!(last_block_by_hash_compact.is_ok());
 
-	warn!(LOGGER, "Testing chain output handler");
+	warn!("Testing chain output handler");
 	let start_height = 0;
 	let end_height = current_tip.height;
 	let outputs_by_height =
@@ -120,7 +124,7 @@ fn simple_server_wallet() {
 	let outputs_by_ids2 = get_outputs_by_ids2(&base_addr, api_server_port, ids.clone());
 	assert!(outputs_by_ids2.is_ok());
 
-	warn!(LOGGER, "Testing txhashset handler");
+	warn!("Testing txhashset handler");
 	let roots = get_txhashset_roots(&base_addr, api_server_port);
 	assert!(roots.is_ok());
 	let last_10_outputs = get_txhashset_lastoutputs(&base_addr, api_server_port, 0);
@@ -144,15 +148,16 @@ fn simple_server_wallet() {
 #[test]
 fn test_p2p() {
 	init_test_logger();
-	info!(LOGGER, "starting test_p2p");
+	info!("starting test_p2p");
 	global::set_mining_mode(ChainTypes::AutomatedTesting);
 
 	let test_name_dir = "test_servers";
-	framework::clean_all_output(test_name_dir);
 
 	// Spawn server and let it run for a bit
+	let server_one_dir = "p2p_server_one";
+	framework::clean_all_output(server_one_dir);
 	let mut server_config_one = LocalServerContainerConfig::default();
-	server_config_one.name = String::from("p2p_server_one");
+	server_config_one.name = String::from(server_one_dir);
 	server_config_one.p2p_server_port = 40002;
 	server_config_one.api_server_port = 40003;
 	server_config_one.start_miner = false;
@@ -164,8 +169,10 @@ fn test_p2p() {
 	thread::sleep(time::Duration::from_millis(1000));
 
 	// Spawn server and let it run for a bit
+	let server_two_dir = "p2p_server_two";
+	framework::clean_all_output(server_two_dir);
 	let mut server_config_two = LocalServerContainerConfig::default();
-	server_config_two.name = String::from("p2p_server_two");
+	server_config_two.name = String::from(server_two_dir);
 	server_config_two.p2p_server_port = 40004;
 	server_config_two.api_server_port = 40005;
 	server_config_two.start_miner = false;
@@ -182,7 +189,7 @@ fn test_p2p() {
 	thread::sleep(time::Duration::from_millis(2000));
 
 	// Starting tests
-	warn!(LOGGER, "Starting P2P Tests");
+	warn!("Starting P2P Tests");
 	let base_addr = server_config_one.base_addr;
 	let api_server_port = server_config_one.api_server_port;
 
@@ -240,13 +247,13 @@ fn test_p2p() {
 // Tip handler function
 fn get_tip(base_addr: &String, api_server_port: u16) -> Result<api::Tip, Error> {
 	let url = format!("http://{}:{}/v1/chain", base_addr, api_server_port);
-	api::client::get::<api::Tip>(url.as_str()).map_err(|e| Error::API(e))
+	api::client::get::<api::Tip>(url.as_str(), None).map_err(|e| Error::API(e))
 }
 
 // Status handler function
 fn get_status(base_addr: &String, api_server_port: u16) -> Result<api::Status, Error> {
 	let url = format!("http://{}:{}/v1/status", base_addr, api_server_port);
-	api::client::get::<api::Status>(url.as_str()).map_err(|e| Error::API(e))
+	api::client::get::<api::Status>(url.as_str(), None).map_err(|e| Error::API(e))
 }
 
 // Block handler functions
@@ -259,7 +266,7 @@ fn get_block_by_height(
 		"http://{}:{}/v1/blocks/{}",
 		base_addr, api_server_port, height
 	);
-	api::client::get::<api::BlockPrintable>(url.as_str()).map_err(|e| Error::API(e))
+	api::client::get::<api::BlockPrintable>(url.as_str(), None).map_err(|e| Error::API(e))
 }
 
 fn get_block_by_height_compact(
@@ -271,7 +278,7 @@ fn get_block_by_height_compact(
 		"http://{}:{}/v1/blocks/{}?compact",
 		base_addr, api_server_port, height
 	);
-	api::client::get::<api::CompactBlockPrintable>(url.as_str()).map_err(|e| Error::API(e))
+	api::client::get::<api::CompactBlockPrintable>(url.as_str(), None).map_err(|e| Error::API(e))
 }
 
 fn get_block_by_hash(
@@ -283,7 +290,7 @@ fn get_block_by_hash(
 		"http://{}:{}/v1/blocks/{}",
 		base_addr, api_server_port, block_hash
 	);
-	api::client::get::<api::BlockPrintable>(url.as_str()).map_err(|e| Error::API(e))
+	api::client::get::<api::BlockPrintable>(url.as_str(), None).map_err(|e| Error::API(e))
 }
 
 fn get_block_by_hash_compact(
@@ -295,7 +302,7 @@ fn get_block_by_hash_compact(
 		"http://{}:{}/v1/blocks/{}?compact",
 		base_addr, api_server_port, block_hash
 	);
-	api::client::get::<api::CompactBlockPrintable>(url.as_str()).map_err(|e| Error::API(e))
+	api::client::get::<api::CompactBlockPrintable>(url.as_str(), None).map_err(|e| Error::API(e))
 }
 
 // Chain output handler functions
@@ -310,7 +317,7 @@ fn get_outputs_by_ids1(
 		api_server_port,
 		ids.join(",")
 	);
-	api::client::get::<Vec<api::Output>>(url.as_str()).map_err(|e| Error::API(e))
+	api::client::get::<Vec<api::Output>>(url.as_str(), None).map_err(|e| Error::API(e))
 }
 
 fn get_outputs_by_ids2(
@@ -327,7 +334,7 @@ fn get_outputs_by_ids2(
 		"http://{}:{}/v1/chain/outputs/byids?{}",
 		base_addr, api_server_port, ids_string
 	);
-	api::client::get::<Vec<api::Output>>(url.as_str()).map_err(|e| Error::API(e))
+	api::client::get::<Vec<api::Output>>(url.as_str(), None).map_err(|e| Error::API(e))
 }
 
 fn get_outputs_by_height(
@@ -340,7 +347,7 @@ fn get_outputs_by_height(
 		"http://{}:{}/v1/chain/outputs/byheight?start_height={}&end_height={}",
 		base_addr, api_server_port, start_height, end_height
 	);
-	api::client::get::<Vec<api::BlockOutputs>>(url.as_str()).map_err(|e| Error::API(e))
+	api::client::get::<Vec<api::BlockOutputs>>(url.as_str(), None).map_err(|e| Error::API(e))
 }
 
 // TxHashSet handler functions
@@ -349,7 +356,7 @@ fn get_txhashset_roots(base_addr: &String, api_server_port: u16) -> Result<api::
 		"http://{}:{}/v1/txhashset/roots",
 		base_addr, api_server_port
 	);
-	api::client::get::<api::TxHashSet>(url.as_str()).map_err(|e| Error::API(e))
+	api::client::get::<api::TxHashSet>(url.as_str(), None).map_err(|e| Error::API(e))
 }
 
 fn get_txhashset_lastoutputs(
@@ -369,7 +376,7 @@ fn get_txhashset_lastoutputs(
 			base_addr, api_server_port, n
 		);
 	}
-	api::client::get::<Vec<api::TxHashSetNode>>(url.as_str()).map_err(|e| Error::API(e))
+	api::client::get::<Vec<api::TxHashSetNode>>(url.as_str(), None).map_err(|e| Error::API(e))
 }
 
 fn get_txhashset_lastrangeproofs(
@@ -389,7 +396,7 @@ fn get_txhashset_lastrangeproofs(
 			base_addr, api_server_port, n
 		);
 	}
-	api::client::get::<Vec<api::TxHashSetNode>>(url.as_str()).map_err(|e| Error::API(e))
+	api::client::get::<Vec<api::TxHashSetNode>>(url.as_str(), None).map_err(|e| Error::API(e))
 }
 
 fn get_txhashset_lastkernels(
@@ -409,7 +416,7 @@ fn get_txhashset_lastkernels(
 			base_addr, api_server_port, n
 		);
 	}
-	api::client::get::<Vec<api::TxHashSetNode>>(url.as_str()).map_err(|e| Error::API(e))
+	api::client::get::<Vec<api::TxHashSetNode>>(url.as_str(), None).map_err(|e| Error::API(e))
 }
 
 // Helper function to get a vec of commitment output ids from a vec of block
@@ -430,7 +437,7 @@ pub fn ban_peer(base_addr: &String, api_server_port: u16, peer_addr: &String) ->
 		"http://{}:{}/v1/peers/{}/ban",
 		base_addr, api_server_port, peer_addr
 	);
-	api::client::post_no_ret(url.as_str(), &"").map_err(|e| Error::API(e))
+	api::client::post_no_ret(url.as_str(), None, &"").map_err(|e| Error::API(e))
 }
 
 pub fn unban_peer(
@@ -442,7 +449,7 @@ pub fn unban_peer(
 		"http://{}:{}/v1/peers/{}/unban",
 		base_addr, api_server_port, peer_addr
 	);
-	api::client::post_no_ret(url.as_str(), &"").map_err(|e| Error::API(e))
+	api::client::post_no_ret(url.as_str(), None, &"").map_err(|e| Error::API(e))
 }
 
 pub fn get_peer(
@@ -454,18 +461,19 @@ pub fn get_peer(
 		"http://{}:{}/v1/peers/{}",
 		base_addr, api_server_port, peer_addr
 	);
-	api::client::get::<p2p::PeerData>(url.as_str()).map_err(|e| Error::API(e))
+	api::client::get::<p2p::PeerData>(url.as_str(), None).map_err(|e| Error::API(e))
 }
 
 pub fn get_connected_peers(
 	base_addr: &String,
 	api_server_port: u16,
-) -> Result<Vec<p2p::PeerInfo>, Error> {
+) -> Result<Vec<p2p::types::PeerInfoDisplay>, Error> {
 	let url = format!(
 		"http://{}:{}/v1/peers/connected",
 		base_addr, api_server_port
 	);
-	api::client::get::<Vec<p2p::PeerInfo>>(url.as_str()).map_err(|e| Error::API(e))
+	api::client::get::<Vec<p2p::types::PeerInfoDisplay>>(url.as_str(), None)
+		.map_err(|e| Error::API(e))
 }
 
 pub fn get_all_peers(
@@ -473,7 +481,7 @@ pub fn get_all_peers(
 	api_server_port: u16,
 ) -> Result<Vec<p2p::PeerData>, Error> {
 	let url = format!("http://{}:{}/v1/peers/all", base_addr, api_server_port);
-	api::client::get::<Vec<p2p::PeerData>>(url.as_str()).map_err(|e| Error::API(e))
+	api::client::get::<Vec<p2p::PeerData>>(url.as_str(), None).map_err(|e| Error::API(e))
 }
 
 /// Error type wrapping underlying module errors.

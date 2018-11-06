@@ -17,15 +17,16 @@
 use std::cmp::max;
 use std::cmp::Ordering;
 use std::collections::HashSet;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::{error, fmt};
+use util::RwLock;
 
 use consensus::{self, VerifySortOrder};
 use core::hash::Hashed;
 use core::verifier_cache::VerifierCache;
 use core::{committed, Committed};
 use keychain::{self, BlindingFactor};
-use ser::{self, read_multi, PMMRable, Readable, Reader, Writeable, Writer};
+use ser::{self, read_multi, FixedLength, PMMRable, Readable, Reader, Writeable, Writer};
 use util;
 use util::secp::pedersen::{Commitment, RangeProof};
 use util::secp::{self, Message, Signature};
@@ -147,8 +148,6 @@ pub struct TxKernel {
 
 hashable_ord!(TxKernel);
 
-/// TODO - no clean way to bridge core::hash::Hash and std::hash::Hash
-/// implementations?
 impl ::std::hash::Hash for TxKernel {
 	fn hash<H: ::std::hash::Hasher>(&self, state: &mut H) {
 		let mut vec = Vec::new();
@@ -176,7 +175,7 @@ impl Readable for TxKernel {
 		let features =
 			KernelFeatures::from_bits(reader.read_u8()?).ok_or(ser::Error::CorruptedData)?;
 		Ok(TxKernel {
-			features: features,
+			features,
 			fee: reader.read_u64()?,
 			lock_height: reader.read_u64()?,
 			excess: Commitment::read(reader)?,
@@ -197,11 +196,20 @@ impl TxKernel {
 	pub fn verify(&self) -> Result<(), secp::Error> {
 		let msg = Message::from_slice(&kernel_sig_msg(self.fee, self.lock_height))?;
 		let secp = static_secp_instance();
-		let secp = secp.lock().unwrap();
+		let secp = secp.lock();
 		let sig = &self.excess_sig;
 		// Verify aggsig directly in libsecp
 		let pubkey = &self.excess.to_pubkey(&secp)?;
-		if !secp::aggsig::verify_single(&secp, &sig, &msg, None, &pubkey, false) {
+		if !secp::aggsig::verify_single(
+			&secp,
+			&sig,
+			&msg,
+			None,
+			&pubkey,
+			Some(&pubkey),
+			None,
+			false,
+		) {
 			return Err(secp::Error::IncorrectSignature);
 		}
 		Ok(())
@@ -220,24 +228,25 @@ impl TxKernel {
 
 	/// Builds a new tx kernel with the provided fee.
 	pub fn with_fee(self, fee: u64) -> TxKernel {
-		TxKernel { fee: fee, ..self }
+		TxKernel { fee, ..self }
 	}
 
 	/// Builds a new tx kernel with the provided lock_height.
 	pub fn with_lock_height(self, lock_height: u64) -> TxKernel {
 		TxKernel {
-			lock_height: lock_height,
+			lock_height,
 			..self
 		}
 	}
 }
 
-impl PMMRable for TxKernel {
-	fn len() -> usize {
-		17 + // features plus fee and lock_height
-			secp::constants::PEDERSEN_COMMITMENT_SIZE + secp::constants::AGG_SIGNATURE_SIZE
-	}
+impl FixedLength for TxKernel {
+	const LEN: usize = 17 // features plus fee and lock_height
+		+ secp::constants::PEDERSEN_COMMITMENT_SIZE
+		+ secp::constants::AGG_SIGNATURE_SIZE;
 }
+
+impl PMMRable for TxKernel {}
 
 /// TransactionBody is a common abstraction for transaction and block
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -283,9 +292,14 @@ impl Readable for TransactionBody {
 		let (input_len, output_len, kernel_len) =
 			ser_multiread!(reader, read_u64, read_u64, read_u64);
 
-		// TODO at this point we know how many input, outputs and kernels
-		// we are about to read. We may want to call a variant of
-		// verify_weight() here as a quick early check.
+		// quick block weight check before proceeding
+		let tx_block_weight =
+			TransactionBody::weight(input_len as usize, output_len as usize, kernel_len as usize)
+				as usize;
+
+		if tx_block_weight > consensus::MAX_BLOCK_WEIGHT {
+			return Err(ser::Error::TooLargeReadErr);
+		}
 
 		let inputs = read_multi(reader, input_len)?;
 		let outputs = read_multi(reader, output_len)?;
@@ -346,9 +360,9 @@ impl TransactionBody {
 		verify_sorted: bool,
 	) -> Result<TransactionBody, Error> {
 		let body = TransactionBody {
-			inputs: inputs,
-			outputs: outputs,
-			kernels: kernels,
+			inputs,
+			outputs,
+			kernels,
 		};
 
 		if verify_sorted {
@@ -404,7 +418,7 @@ impl TransactionBody {
 	}
 
 	/// Total fee for a TransactionBody is the sum of fees of all kernels.
-	pub fn fee(&self) -> u64 {
+	fn fee(&self) -> u64 {
 		self.kernels
 			.iter()
 			.fold(0, |acc, ref x| acc.saturating_add(x.fee))
@@ -424,16 +438,16 @@ impl TransactionBody {
 		TransactionBody::weight_as_block(self.inputs.len(), self.outputs.len(), self.kernels.len())
 	}
 
-	/// Calculate transaction weight from transaction details
+	/// Calculate transaction weight from transaction details. This is non
+	/// consensus critical and compared to block weight, incentivizes spending
+	/// more outputs (to lower the fee).
 	pub fn weight(input_len: usize, output_len: usize, kernel_len: usize) -> u32 {
-		let mut body_weight = -1 * (input_len as i32) + (4 * output_len as i32) + kernel_len as i32;
-		if body_weight < 1 {
-			body_weight = 1;
-		}
-		body_weight as u32
+		let body_weight = -(input_len as i32) + (4 * output_len as i32) + kernel_len as i32;
+		max(body_weight, 1) as u32
 	}
 
-	/// Calculate transaction weight using block weighing from transaction details
+	/// Calculate transaction weight using block weighing from transaction
+	/// details. Consensus critical and uses consensus weight values.
 	pub fn weight_as_block(input_len: usize, output_len: usize, kernel_len: usize) -> u32 {
 		(input_len * consensus::BLOCK_INPUT_WEIGHT
 			+ output_len * consensus::BLOCK_OUTPUT_WEIGHT
@@ -444,7 +458,9 @@ impl TransactionBody {
 	pub fn lock_height(&self) -> u64 {
 		self.kernels
 			.iter()
-			.fold(0, |acc, ref x| max(acc, x.lock_height))
+			.map(|x| x.lock_height)
+			.max()
+			.unwrap_or(0)
 	}
 
 	// Verify the body is not too big in terms of number of inputs|outputs|kernels.
@@ -474,12 +490,12 @@ impl TransactionBody {
 
 	// Verify that no input is spending an output from the same block.
 	fn verify_cut_through(&self) -> Result<(), Error> {
+		let mut out_set = HashSet::new();
+		for out in &self.outputs {
+			out_set.insert(out.commitment());
+		}
 		for inp in &self.inputs {
-			if self
-				.outputs
-				.iter()
-				.any(|out| out.commitment() == inp.commitment())
-			{
+			if out_set.contains(&inp.commitment()) {
 				return Err(Error::CutThrough);
 			}
 		}
@@ -538,18 +554,16 @@ impl TransactionBody {
 		with_reward: bool,
 		verifier: Arc<RwLock<VerifierCache>>,
 	) -> Result<(), Error> {
-		self.verify_weight(with_reward)?;
-		self.verify_sorted()?;
-		self.verify_cut_through()?;
+		self.validate_read(with_reward)?;
 
 		// Find all the outputs that have not had their rangeproofs verified.
 		let outputs = {
-			let mut verifier = verifier.write().unwrap();
+			let mut verifier = verifier.write();
 			verifier.filter_rangeproof_unverified(&self.outputs)
 		};
 
 		// Now batch verify all those unverified rangeproofs
-		if outputs.len() > 0 {
+		if !outputs.is_empty() {
 			let mut commits = vec![];
 			let mut proofs = vec![];
 			for x in &outputs {
@@ -561,7 +575,7 @@ impl TransactionBody {
 
 		// Find all the kernels that have not yet been verified.
 		let kernels = {
-			let mut verifier = verifier.write().unwrap();
+			let mut verifier = verifier.write();
 			verifier.filter_kernel_sig_unverified(&self.kernels)
 		};
 
@@ -574,7 +588,7 @@ impl TransactionBody {
 
 		// Cache the successful verification results for the new outputs and kernels.
 		{
-			let mut verifier = verifier.write().unwrap();
+			let mut verifier = verifier.write();
 			verifier.add_rangeproof_verified(outputs);
 			verifier.add_kernel_sig_verified(kernels);
 		}
@@ -677,10 +691,7 @@ impl Transaction {
 	/// Creates a new transaction using this transaction as a template
 	/// and with the specified offset.
 	pub fn with_offset(self, offset: BlindingFactor) -> Transaction {
-		Transaction {
-			offset: offset,
-			..self
-		}
+		Transaction { offset, ..self }
 	}
 
 	/// Builds a new transaction with the provided inputs added. Existing
@@ -748,7 +759,8 @@ impl Transaction {
 		self.body.fee()
 	}
 
-	fn overage(&self) -> i64 {
+	/// Total overage across all kernels.
+	pub fn overage(&self) -> i64 {
 		self.body.overage()
 	}
 
@@ -822,10 +834,7 @@ pub fn cut_through(inputs: &mut Vec<Input>, outputs: &mut Vec<Output>) -> Result
 }
 
 /// Aggregate a vec of txs into a multi-kernel tx with cut_through.
-pub fn aggregate(
-	mut txs: Vec<Transaction>,
-	verifier: Arc<RwLock<VerifierCache>>,
-) -> Result<Transaction, Error> {
+pub fn aggregate(mut txs: Vec<Transaction>) -> Result<Transaction, Error> {
 	// convenience short-circuiting
 	if txs.is_empty() {
 		return Ok(Transaction::empty());
@@ -867,22 +876,12 @@ pub fn aggregate(
 	//   * sum of all kernel offsets
 	let tx = Transaction::new(inputs, outputs, kernels).with_offset(total_kernel_offset);
 
-	// Now validate the aggregate tx to ensure we have not built something invalid.
-	// The resulting tx could be invalid for a variety of reasons -
-	//   * tx too large (too many inputs|outputs|kernels)
-	//   * cut-through may have invalidated the sums
-	tx.validate(verifier)?;
-
 	Ok(tx)
 }
 
 /// Attempt to deaggregate a multi-kernel transaction based on multiple
 /// transactions
-pub fn deaggregate(
-	mk_tx: Transaction,
-	txs: Vec<Transaction>,
-	verifier: Arc<RwLock<VerifierCache>>,
-) -> Result<Transaction, Error> {
+pub fn deaggregate(mk_tx: Transaction, txs: Vec<Transaction>) -> Result<Transaction, Error> {
 	let mut inputs: Vec<Input> = vec![];
 	let mut outputs: Vec<Output> = vec![];
 	let mut kernels: Vec<TxKernel> = vec![];
@@ -891,7 +890,7 @@ pub fn deaggregate(
 	// transaction
 	let mut kernel_offsets = vec![];
 
-	let tx = aggregate(txs, verifier.clone())?;
+	let tx = aggregate(txs)?;
 
 	for mk_input in mk_tx.body.inputs {
 		if !tx.body.inputs.contains(&mk_input) && !inputs.contains(&mk_input) {
@@ -914,7 +913,7 @@ pub fn deaggregate(
 	// now compute the total kernel offset
 	let total_kernel_offset = {
 		let secp = static_secp_instance();
-		let secp = secp.lock().unwrap();
+		let secp = secp.lock();
 		let mut positive_key = vec![mk_tx.offset]
 			.into_iter()
 			.filter(|x| *x != BlindingFactor::zero())
@@ -941,9 +940,6 @@ pub fn deaggregate(
 
 	// Build a new tx from the above data.
 	let tx = Transaction::new(inputs, outputs, kernels).with_offset(total_kernel_offset);
-
-	// Now validate the resulting tx to ensure we have not built something invalid.
-	tx.validate(verifier)?;
 	Ok(tx)
 }
 
@@ -961,8 +957,6 @@ pub struct Input {
 
 hashable_ord!(Input);
 
-/// TODO - no clean way to bridge core::hash::Hash and std::hash::Hash
-/// implementations?
 impl ::std::hash::Hash for Input {
 	fn hash<H: ::std::hash::Hasher>(&self, state: &mut H) {
 		let mut vec = Vec::new();
@@ -1044,8 +1038,6 @@ pub struct Output {
 
 hashable_ord!(Output);
 
-/// TODO - no clean way to bridge core::hash::Hash and std::hash::Hash
-/// implementations?
 impl ::std::hash::Hash for Output {
 	fn hash<H: ::std::hash::Hasher>(&self, state: &mut H) {
 		let mut vec = Vec::new();
@@ -1061,7 +1053,7 @@ impl Writeable for Output {
 		writer.write_u8(self.features.bits())?;
 		self.commit.write(writer)?;
 		// The hash of an output doesn't include the range proof, which
-		// is commit to separately
+		// is committed to separately
 		if writer.serialization_mode() != ser::SerializationMode::Hash {
 			writer.write_bytes(&self.proof)?
 		}
@@ -1077,7 +1069,7 @@ impl Readable for Output {
 			OutputFeatures::from_bits(reader.read_u8()?).ok_or(ser::Error::CorruptedData)?;
 
 		Ok(Output {
-			features: features,
+			features,
 			commit: Commitment::read(reader)?,
 			proof: RangeProof::read(reader)?,
 		})
@@ -1098,7 +1090,7 @@ impl Output {
 	/// Validates the range proof using the commitment
 	pub fn verify_proof(&self) -> Result<(), secp::Error> {
 		let secp = static_secp_instance();
-		let secp = secp.lock().unwrap();
+		let secp = secp.lock();
 		match secp.verify_bullet_proof(self.commit, self.proof, None) {
 			Ok(_) => Ok(()),
 			Err(e) => Err(e),
@@ -1111,7 +1103,7 @@ impl Output {
 		proofs: &Vec<RangeProof>,
 	) -> Result<(), secp::Error> {
 		let secp = static_secp_instance();
-		let secp = secp.lock().unwrap();
+		let secp = secp.lock();
 		match secp.verify_bullet_proof_multi(commits.clone(), proofs.clone(), None) {
 			Ok(_) => Ok(()),
 			Err(e) => Err(e),
@@ -1136,8 +1128,8 @@ impl OutputIdentifier {
 	/// Build a new output_identifier.
 	pub fn new(features: OutputFeatures, commit: &Commitment) -> OutputIdentifier {
 		OutputIdentifier {
-			features: features,
-			commit: commit.clone(),
+			features,
+			commit: *commit,
 		}
 	}
 
@@ -1157,9 +1149,9 @@ impl OutputIdentifier {
 	/// Converts this identifier to a full output, provided a RangeProof
 	pub fn into_output(self, proof: RangeProof) -> Output {
 		Output {
+			proof,
 			features: self.features,
 			commit: self.commit,
-			proof: proof,
 		}
 	}
 
@@ -1181,12 +1173,11 @@ impl OutputIdentifier {
 	}
 }
 
-/// Ensure this is implemented to centralize hashing with indexes
-impl PMMRable for OutputIdentifier {
-	fn len() -> usize {
-		1 + secp::constants::PEDERSEN_COMMITMENT_SIZE
-	}
+impl FixedLength for OutputIdentifier {
+	const LEN: usize = 1 + secp::constants::PEDERSEN_COMMITMENT_SIZE;
 }
+
+impl PMMRable for OutputIdentifier {}
 
 impl Writeable for OutputIdentifier {
 	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), ser::Error> {
@@ -1201,8 +1192,8 @@ impl Readable for OutputIdentifier {
 		let features =
 			OutputFeatures::from_bits(reader.read_u8()?).ok_or(ser::Error::CorruptedData)?;
 		Ok(OutputIdentifier {
+			features,
 			commit: Commitment::read(reader)?,
-			features: features,
 		})
 	}
 }
@@ -1218,7 +1209,7 @@ mod test {
 	#[test]
 	fn test_kernel_ser_deser() {
 		let keychain = ExtKeychain::from_random_seed().unwrap();
-		let key_id = keychain.derive_key_id(1).unwrap();
+		let key_id = ExtKeychain::derive_key_id(1, 1, 0, 0, 0);
 		let commit = keychain.commit(5, &key_id).unwrap();
 
 		// just some bytes for testing ser/deser
@@ -1263,10 +1254,10 @@ mod test {
 	#[test]
 	fn commit_consistency() {
 		let keychain = ExtKeychain::from_seed(&[0; 32]).unwrap();
-		let key_id = keychain.derive_key_id(1).unwrap();
+		let key_id = ExtKeychain::derive_key_id(1, 1, 0, 0, 0);
 
 		let commit = keychain.commit(1003, &key_id).unwrap();
-		let key_id = keychain.derive_key_id(1).unwrap();
+		let key_id = ExtKeychain::derive_key_id(1, 1, 0, 0, 0);
 
 		let commit_2 = keychain.commit(1003, &key_id).unwrap();
 
@@ -1276,7 +1267,7 @@ mod test {
 	#[test]
 	fn input_short_id() {
 		let keychain = ExtKeychain::from_seed(&[0; 32]).unwrap();
-		let key_id = keychain.derive_key_id(1).unwrap();
+		let key_id = ExtKeychain::derive_key_id(1, 1, 0, 0, 0);
 		let commit = keychain.commit(5, &key_id).unwrap();
 
 		let input = Input {
@@ -1291,7 +1282,7 @@ mod test {
 		let nonce = 0;
 
 		let short_id = input.short_id(&block_hash, nonce);
-		assert_eq!(short_id, ShortId::from_hex("28fea5a693af").unwrap());
+		assert_eq!(short_id, ShortId::from_hex("df31d96e3cdb").unwrap());
 
 		// now generate the short_id for a *very* similar output (single feature flag
 		// different) and check it generates a different short_id
@@ -1301,6 +1292,6 @@ mod test {
 		};
 
 		let short_id = input.short_id(&block_hash, nonce);
-		assert_eq!(short_id, ShortId::from_hex("2df325971ab0").unwrap());
+		assert_eq!(short_id, ShortId::from_hex("784fc5afd5d9").unwrap());
 	}
 }

@@ -26,7 +26,6 @@ use core::pow::Difficulty;
 use core::ser::{self, Readable, Reader, Writeable, Writer};
 
 use types::{Capabilities, Error, ReasonForBan, MAX_BLOCK_HEADERS, MAX_LOCATORS, MAX_PEER_ADDRS};
-use util::LOGGER;
 
 /// Current latest version of the protocol
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -35,7 +34,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub const USER_AGENT: &'static str = concat!("MW/Grin ", env!("CARGO_PKG_VERSION"));
 
 /// Magic number expected in the header of every message
-const MAGIC: [u8; 2] = [0x1e, 0xc5];
+const MAGIC: [u8; 2] = [0x54, 0x34];
 
 /// Size in bytes of a message header
 pub const HEADER_LEN: u64 = 11;
@@ -207,8 +206,8 @@ pub fn read_header(conn: &mut TcpStream, msg_type: Option<Type>) -> Result<MsgHe
 	// TODO 4x the limits for now to leave ourselves space to change things
 	if header.msg_len > max_len * 4 {
 		error!(
-			LOGGER,
-			"Too large read {}, had {}, wanted {}.", header.msg_type as u8, max_len, header.msg_len
+			"Too large read {}, had {}, wanted {}.",
+			header.msg_type as u8, max_len, header.msg_len
 		);
 		return Err(Error::Serialization(ser::Error::TooLargeReadErr));
 	}
@@ -552,7 +551,7 @@ impl Readable for SockAddr {
 				port,
 			))))
 		} else {
-			let ip = try_map_vec!([0..8], |_| reader.read_u16());
+			let ip = try_iter_map_vec!(0..8, |_| reader.read_u16());
 			let port = reader.read_u16()?;
 			Ok(SockAddr(SocketAddr::V6(SocketAddrV6::new(
 				Ipv6Addr::new(ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], ip[6], ip[7]),

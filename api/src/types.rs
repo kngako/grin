@@ -97,9 +97,9 @@ impl TxHashSet {
 	pub fn from_head(head: Arc<chain::Chain>) -> TxHashSet {
 		let roots = head.get_txhashset_roots();
 		TxHashSet {
-			output_root_hash: roots.0.to_hex(),
-			range_proof_root_hash: roots.1.to_hex(),
-			kernel_root_hash: roots.2.to_hex(),
+			output_root_hash: roots.output_root.to_hex(),
+			range_proof_root_hash: roots.rproof_root.to_hex(),
+			kernel_root_hash: roots.kernel_root.to_hex(),
 		}
 	}
 }
@@ -280,8 +280,8 @@ impl OutputPrintable {
 		let mut merkle_proof = None;
 		if output
 			.features
-			.contains(core::transaction::OutputFeatures::COINBASE_OUTPUT) && !spent
-			&& block_header.is_some()
+			.contains(core::transaction::OutputFeatures::COINBASE_OUTPUT)
+			&& !spent && block_header.is_some()
 		{
 			merkle_proof = chain.get_merkle_proof(&out_id, &block_header.unwrap()).ok()
 		};
@@ -472,11 +472,11 @@ pub struct BlockHeaderInfo {
 }
 
 impl BlockHeaderInfo {
-	pub fn from_header(h: &core::BlockHeader) -> BlockHeaderInfo {
+	pub fn from_header(header: &core::BlockHeader) -> BlockHeaderInfo {
 		BlockHeaderInfo {
-			hash: util::to_hex(h.hash().to_vec()),
-			height: h.height,
-			previous: util::to_hex(h.previous.to_vec()),
+			hash: util::to_hex(header.hash().to_vec()),
+			height: header.height,
+			previous: util::to_hex(header.prev_hash.to_vec()),
 		}
 	}
 }
@@ -491,6 +491,8 @@ pub struct BlockHeaderPrintable {
 	pub height: u64,
 	/// Hash of the block previous to this in the chain.
 	pub previous: String,
+	/// Root hash of the header MMR at the previous header.
+	pub prev_root: String,
 	/// rfc3339 timestamp at which the block was built.
 	pub timestamp: String,
 	/// Merklish root of all the commitments in the TxHashSet
@@ -502,30 +504,35 @@ pub struct BlockHeaderPrintable {
 	/// Nonce increment used to mine this block.
 	pub nonce: u64,
 	/// Size of the cuckoo graph
-	pub cuckoo_size: u8,
+	pub edge_bits: u8,
+	/// Nonces of the cuckoo solution
 	pub cuckoo_solution: Vec<u64>,
 	/// Total accumulated difficulty since genesis block
 	pub total_difficulty: u64,
+	/// Variable difficulty scaling factor for secondary proof of work
+	pub secondary_scaling: u32,
 	/// Total kernel offset since genesis block
 	pub total_kernel_offset: String,
 }
 
 impl BlockHeaderPrintable {
-	pub fn from_header(h: &core::BlockHeader) -> BlockHeaderPrintable {
+	pub fn from_header(header: &core::BlockHeader) -> BlockHeaderPrintable {
 		BlockHeaderPrintable {
-			hash: util::to_hex(h.hash().to_vec()),
-			version: h.version,
-			height: h.height,
-			previous: util::to_hex(h.previous.to_vec()),
-			timestamp: h.timestamp.to_rfc3339(),
-			output_root: util::to_hex(h.output_root.to_vec()),
-			range_proof_root: util::to_hex(h.range_proof_root.to_vec()),
-			kernel_root: util::to_hex(h.kernel_root.to_vec()),
-			nonce: h.pow.nonce,
-			cuckoo_size: h.pow.cuckoo_sizeshift(),
-			cuckoo_solution: h.pow.proof.nonces.clone(),
-			total_difficulty: h.pow.total_difficulty.to_num(),
-			total_kernel_offset: h.total_kernel_offset.to_hex(),
+			hash: util::to_hex(header.hash().to_vec()),
+			version: header.version,
+			height: header.height,
+			previous: util::to_hex(header.prev_hash.to_vec()),
+			prev_root: util::to_hex(header.prev_root.to_vec()),
+			timestamp: header.timestamp.to_rfc3339(),
+			output_root: util::to_hex(header.output_root.to_vec()),
+			range_proof_root: util::to_hex(header.range_proof_root.to_vec()),
+			kernel_root: util::to_hex(header.kernel_root.to_vec()),
+			nonce: header.pow.nonce,
+			edge_bits: header.pow.edge_bits(),
+			cuckoo_solution: header.pow.proof.nonces.clone(),
+			total_difficulty: header.pow.total_difficulty.to_num(),
+			secondary_scaling: header.pow.secondary_scaling,
+			total_kernel_offset: header.total_kernel_offset.to_hex(),
 		}
 	}
 }
@@ -564,8 +571,7 @@ impl BlockPrintable {
 					Some(&block.header),
 					include_proof,
 				)
-			})
-			.collect();
+			}).collect();
 		let kernels = block
 			.kernels()
 			.iter()

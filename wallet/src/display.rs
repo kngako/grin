@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use core::core::{self, amount_to_hr_string};
-use libwallet::types::{OutputData, TxLogEntry, WalletInfo};
+use libwallet::types::{AcctPathMapping, OutputData, OutputStatus, TxLogEntry, WalletInfo};
 use libwallet::Error;
 use prettytable;
 use std::io::prelude::Write;
@@ -23,11 +23,16 @@ use util::secp::pedersen;
 
 /// Display outputs in a pretty way
 pub fn outputs(
+	account: &str,
 	cur_height: u64,
 	validated: bool,
 	outputs: Vec<(OutputData, pedersen::Commitment)>,
+	dark_background_color_scheme: bool,
 ) -> Result<(), Error> {
-	let title = format!("Wallet Outputs - Block Height: {}", cur_height);
+	let title = format!(
+		"Wallet Outputs - Account '{}' - Block Height: {}",
+		account, cur_height
+	);
 	println!();
 	let mut t = term::stdout().unwrap();
 	t.fg(term::color::MAGENTA).unwrap();
@@ -51,24 +56,44 @@ pub fn outputs(
 		let commit = format!("{}", util::to_hex(commit.as_ref().to_vec()));
 		let height = format!("{}", out.height);
 		let lock_height = format!("{}", out.lock_height);
-		let status = format!("{:?}", out.status);
 		let is_coinbase = format!("{}", out.is_coinbase);
+
+		// Mark unconfirmed coinbase outputs as "Mining" instead of "Unconfirmed"
+		let status = match out.status {
+			OutputStatus::Unconfirmed if out.is_coinbase => "Mining".to_string(),
+			_ => format!("{}", out.status),
+		};
+
 		let num_confirmations = format!("{}", out.num_confirmations(cur_height));
 		let value = format!("{}", core::amount_to_hr_string(out.value, false));
 		let tx = match out.tx_log_entry {
 			None => "".to_owned(),
 			Some(t) => t.to_string(),
 		};
-		table.add_row(row![
-			bFC->commit,
-			bFB->height,
-			bFB->lock_height,
-			bFR->status,
-			bFY->is_coinbase,
-			bFB->num_confirmations,
-			bFG->value,
-			bFC->tx,
-		]);
+
+		if dark_background_color_scheme {
+			table.add_row(row![
+				bFC->commit,
+				bFB->height,
+				bFB->lock_height,
+				bFR->status,
+				bFY->is_coinbase,
+				bFB->num_confirmations,
+				bFG->value,
+				bFC->tx,
+			]);
+		} else {
+			table.add_row(row![
+				bFD->commit,
+				bFB->height,
+				bFB->lock_height,
+				bFR->status,
+				bFD->is_coinbase,
+				bFB->num_confirmations,
+				bFG->value,
+				bFD->tx,
+			]);
+		}
 	}
 
 	table.set_format(*prettytable::format::consts::FORMAT_NO_COLSEP);
@@ -87,12 +112,17 @@ pub fn outputs(
 
 /// Display transaction log in a pretty way
 pub fn txs(
+	account: &str,
 	cur_height: u64,
 	validated: bool,
 	txs: Vec<TxLogEntry>,
 	include_status: bool,
+	dark_background_color_scheme: bool,
 ) -> Result<(), Error> {
-	let title = format!("Transaction Log - Block Height: {}", cur_height);
+	let title = format!(
+		"Transaction Log - Account '{}' - Block Height: {}",
+		account, cur_height
+	);
 	println!();
 	let mut t = term::stdout().unwrap();
 	t.fg(term::color::MAGENTA).unwrap();
@@ -108,13 +138,13 @@ pub fn txs(
 		bMG->"Creation Time",
 		bMG->"Confirmed?",
 		bMG->"Confirmation Time",
-		bMG->"Num. Inputs",
-		bMG->"Num. Outputs",
-		bMG->"Amount Credited",
-		bMG->"Amount Debited",
+		bMG->"Num. \nInputs",
+		bMG->"Num. \nOutputs",
+		bMG->"Amount \nCredited",
+		bMG->"Amount \nDebited",
 		bMG->"Fee",
-		bMG->"Net Difference",
-		bMG->"Tx Data",
+		bMG->"Net \nDifference",
+		bMG->"Tx \nData",
 	]);
 
 	for t in txs {
@@ -150,21 +180,57 @@ pub fn txs(
 			Some(_) => format!("Exists"),
 			None => "None".to_owned(),
 		};
-		table.add_row(row![
-			bFC->id,
-			bFC->entry_type,
-			bFC->slate_id,
-			bFB->creation_ts,
-			bFC->confirmed,
-			bFB->confirmation_ts,
-			bFC->num_inputs,
-			bFC->num_outputs,
-			bFG->amount_credited_str,
-			bFR->amount_debited_str,
-			bFR->fee,
-			bFY->net_diff,
-			bFb->tx_data,
-		]);
+		if dark_background_color_scheme {
+			table.add_row(row![
+				bFC->id,
+				bFC->entry_type,
+				bFC->slate_id,
+				bFB->creation_ts,
+				bFC->confirmed,
+				bFB->confirmation_ts,
+				bFC->num_inputs,
+				bFC->num_outputs,
+				bFG->amount_credited_str,
+				bFR->amount_debited_str,
+				bFR->fee,
+				bFY->net_diff,
+				bFb->tx_data,
+			]);
+		} else {
+			if t.confirmed {
+				table.add_row(row![
+					bFD->id,
+					bFb->entry_type,
+					bFD->slate_id,
+					bFB->creation_ts,
+					bFg->confirmed,
+					bFB->confirmation_ts,
+					bFD->num_inputs,
+					bFD->num_outputs,
+					bFG->amount_credited_str,
+					bFD->amount_debited_str,
+					bFD->fee,
+					bFG->net_diff,
+					bFB->tx_data,
+				]);
+			} else {
+				table.add_row(row![
+					bFD->id,
+					bFb->entry_type,
+					bFD->slate_id,
+					bFB->creation_ts,
+					bFR->confirmed,
+					bFB->confirmation_ts,
+					bFD->num_inputs,
+					bFD->num_outputs,
+					bFG->amount_credited_str,
+					bFD->amount_debited_str,
+					bFD->fee,
+					bFG->net_diff,
+					bFB->tx_data,
+				]);
+			}
+		}
 	}
 
 	table.set_format(*prettytable::format::consts::FORMAT_NO_COLSEP);
@@ -181,19 +247,35 @@ pub fn txs(
 	Ok(())
 }
 /// Display summary info in a pretty way
-pub fn info(wallet_info: &WalletInfo, validated: bool) {
+pub fn info(
+	account: &str,
+	wallet_info: &WalletInfo,
+	validated: bool,
+	dark_background_color_scheme: bool,
+) {
 	println!(
-		"\n____ Wallet Summary Info as of {} ____\n",
-		wallet_info.last_confirmed_height
+		"\n____ Wallet Summary Info - Account '{}' as of height {} ____\n",
+		account, wallet_info.last_confirmed_height
 	);
-	let mut table = table!(
-		[bFG->"Total", FG->amount_to_hr_string(wallet_info.total, false)],
-		[bFY->"Awaiting Confirmation", FY->amount_to_hr_string(wallet_info.amount_awaiting_confirmation, false)],
-		[bFY->"Immature Coinbase", FY->amount_to_hr_string(wallet_info.amount_immature, false)],
-		[bFG->"Currently Spendable", FG->amount_to_hr_string(wallet_info.amount_currently_spendable, false)],
-		[Fw->"---------", Fw->"---------"],
-		[Fr->"(Locked by previous transaction)", Fr->amount_to_hr_string(wallet_info.amount_locked, false)]
-	);
+	let mut table = if dark_background_color_scheme {
+		table!(
+			[bFG->"Total", FG->amount_to_hr_string(wallet_info.total, false)],
+			[bFY->"Awaiting Confirmation", FY->amount_to_hr_string(wallet_info.amount_awaiting_confirmation, false)],
+			[bFY->"Immature Coinbase", FY->amount_to_hr_string(wallet_info.amount_immature, false)],
+			[bFG->"Currently Spendable", FG->amount_to_hr_string(wallet_info.amount_currently_spendable, false)],
+			[Fw->"--------------------------------", Fw->"-------------"],
+			[Fr->"(Locked by previous transaction)", Fr->amount_to_hr_string(wallet_info.amount_locked, false)]
+		)
+	} else {
+		table!(
+			[bFG->"Total", FG->amount_to_hr_string(wallet_info.total, false)],
+			[bFB->"Awaiting Confirmation", FB->amount_to_hr_string(wallet_info.amount_awaiting_confirmation, false)],
+			[bFB->"Immature Coinbase", FB->amount_to_hr_string(wallet_info.amount_immature, false)],
+			[bFG->"Currently Spendable", FG->amount_to_hr_string(wallet_info.amount_currently_spendable, false)],
+			[Fw->"--------------------------------", Fw->"-------------"],
+			[Fr->"(Locked by previous transaction)", Fr->amount_to_hr_string(wallet_info.amount_locked, false)]
+		)
+	};
 	table.set_format(*prettytable::format::consts::FORMAT_NO_BORDER_LINE_SEPARATOR);
 	table.printstd();
 	println!();
@@ -204,4 +286,23 @@ pub fn info(wallet_info: &WalletInfo, validated: bool) {
 			 (is your `grin server` offline or broken?)"
 		);
 	}
+}
+/// Display list of wallet accounts in a pretty way
+pub fn accounts(acct_mappings: Vec<AcctPathMapping>) {
+	println!("\n____ Wallet Accounts ____\n",);
+	let mut table = table!();
+
+	table.set_titles(row![
+		mMG->"Name",
+		bMG->"Parent BIP-32 Derivation Path",
+	]);
+	for m in acct_mappings {
+		table.add_row(row![
+			bFC->m.label,
+			bGC->m.path.to_bip_32_string(),
+		]);
+	}
+	table.set_format(*prettytable::format::consts::FORMAT_NO_BORDER_LINE_SEPARATOR);
+	table.printstd();
+	println!();
 }

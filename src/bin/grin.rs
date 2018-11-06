@@ -24,7 +24,7 @@ extern crate daemonize;
 extern crate serde;
 extern crate serde_json;
 #[macro_use]
-extern crate slog;
+extern crate log;
 extern crate term;
 
 extern crate grin_api as api;
@@ -45,40 +45,42 @@ use clap::{App, Arg, SubCommand};
 
 use config::config::{SERVER_CONFIG_FILE_NAME, WALLET_CONFIG_FILE_NAME};
 use core::global;
-use util::{init_logger, LOGGER};
+use util::init_logger;
 
 // include build information
 pub mod built_info {
 	include!(concat!(env!("OUT_DIR"), "/built.rs"));
 }
 
-pub fn info_strings() -> (String, String, String) {
+pub fn info_strings() -> (String, String) {
 	(
 		format!(
 			"This is Grin version {}{}, built for {} by {}.",
 			built_info::PKG_VERSION,
 			built_info::GIT_VERSION.map_or_else(|| "".to_owned(), |v| format!(" (git {})", v)),
 			built_info::TARGET,
-			built_info::RUSTC_VERSION
+			built_info::RUSTC_VERSION,
 		).to_string(),
 		format!(
-			"Built with profile \"{}\", features \"{}\" on {}.",
+			"Built with profile \"{}\", features \"{}\".",
 			built_info::PROFILE,
 			built_info::FEATURES_STR,
-			built_info::BUILT_TIME_UTC
 		).to_string(),
-		format!("Dependencies:\n {}", built_info::DEPENDENCIES_STR).to_string(),
 	)
 }
 
 fn log_build_info() {
-	let (basic_info, detailed_info, deps) = info_strings();
-	info!(LOGGER, "{}", basic_info);
-	debug!(LOGGER, "{}", detailed_info);
-	trace!(LOGGER, "{}", deps);
+	let (basic_info, detailed_info) = info_strings();
+	info!("{}", basic_info);
+	debug!("{}", detailed_info);
 }
 
 fn main() {
+	let exit_code = real_main();
+	std::process::exit(exit_code);
+}
+
+fn real_main() -> i32 {
 	let args = App::new("Grin")
 		.version(crate_version!())
 		.author("The Grin Team")
@@ -97,7 +99,7 @@ fn main() {
                      .help("Port to start the P2P server on")
                      .takes_value(true))
                 .arg(Arg::with_name("api_port")
-                     .short("a")
+                     .short("api")
                      .long("api_port")
                      .help("Port on which to start the api server (e.g. transaction pool api)")
                      .takes_value(true))
@@ -154,6 +156,12 @@ fn main() {
 			.help("Wallet passphrase used to generate the private key seed")
 			.takes_value(true)
 			.default_value(""))
+		.arg(Arg::with_name("account")
+			.short("a")
+			.long("account")
+			.help("Wallet account to use for this operation")
+			.takes_value(true)
+			.default_value("default"))
 		.arg(Arg::with_name("data_dir")
 			.short("dd")
 			.long("data_dir")
@@ -171,10 +179,18 @@ fn main() {
 			.help("Show spent outputs on wallet output command")
 			.takes_value(false))
 		.arg(Arg::with_name("api_server_address")
-			.short("a")
+			.short("r")
 			.long("api_server_address")
 			.help("Api address of running node on which to check inputs and post transactions")
 			.takes_value(true))
+
+		.subcommand(SubCommand::with_name("account")
+			.about("List wallet accounts or create a new account")
+			.arg(Arg::with_name("create")
+				.short("c")
+				.long("create")
+				.help("Name of new wallet account")
+				.takes_value(true)))
 
 		.subcommand(SubCommand::with_name("listen")
 			.about("Runs the wallet in listening mode waiting for transactions.")
@@ -332,7 +348,7 @@ fn main() {
 			// If it's just a server config command, do it and exit
 			if let ("config", Some(_)) = server_args.subcommand() {
 				cmd::config_command_server(SERVER_CONFIG_FILE_NAME);
-				return;
+				return 0;
 			}
 		}
 		("wallet", Some(wallet_args)) => {
@@ -363,8 +379,7 @@ fn main() {
 			let mut l = w.members.as_mut().unwrap().logging.clone().unwrap();
 			l.tui_running = Some(false);
 			init_logger(Some(l));
-			warn!(
-				LOGGER,
+			info!(
 				"Using wallet configuration file at {}",
 				w.config_file_path.as_ref().unwrap().to_str().unwrap()
 			);
@@ -385,12 +400,11 @@ fn main() {
 			global::set_mining_mode(s.members.as_mut().unwrap().server.clone().chain_type);
 			if let Some(file_path) = &s.config_file_path {
 				info!(
-					LOGGER,
 					"Using configuration file at {}",
 					file_path.to_str().unwrap()
 				);
 			} else {
-				info!(LOGGER, "Node configuration file not found, using default");
+				info!("Node configuration file not found, using default");
 			}
 			node_config = Some(s);
 		}
@@ -401,24 +415,18 @@ fn main() {
 	match args.subcommand() {
 		// server commands and options
 		("server", Some(server_args)) => {
-			cmd::server_command(Some(server_args), node_config.unwrap());
+			cmd::server_command(Some(server_args), node_config.unwrap())
 		}
 
 		// client commands and options
-		("client", Some(client_args)) => {
-			cmd::client_command(client_args, node_config.unwrap());
-		}
+		("client", Some(client_args)) => cmd::client_command(client_args, node_config.unwrap()),
 
 		// client commands and options
-		("wallet", Some(wallet_args)) => {
-			cmd::wallet_command(wallet_args, wallet_config.unwrap());
-		}
+		("wallet", Some(wallet_args)) => cmd::wallet_command(wallet_args, wallet_config.unwrap()),
 
 		// If nothing is specified, try to just use the config file instead
 		// this could possibly become the way to configure most things
 		// with most command line options being phased out
-		_ => {
-			cmd::server_command(None, node_config.unwrap());
-		}
+		_ => cmd::server_command(None, node_config.unwrap()),
 	}
 }

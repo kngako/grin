@@ -16,7 +16,8 @@
 //! around during an interactive wallet exchange
 
 use rand::thread_rng;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use util::RwLock;
 use uuid::Uuid;
 
 use core::core::committed::Committed;
@@ -26,9 +27,9 @@ use keychain::{BlindSum, BlindingFactor, Keychain};
 use libtx::error::{Error, ErrorKind};
 use libtx::{aggsig, build, tx_fee};
 
+use util::secp;
 use util::secp::key::{PublicKey, SecretKey};
 use util::secp::Signature;
-use util::{secp, LOGGER};
 
 /// Public data for each participant in the slate
 
@@ -162,6 +163,7 @@ impl Slate {
 			sec_key,
 			sec_nonce,
 			&self.pub_nonce_sum(keychain.secp())?,
+			Some(&self.pub_blind_sum(keychain.secp())?),
 			self.fee,
 			self.lock_height,
 		)?;
@@ -287,7 +289,7 @@ impl Slate {
 				amount_to_hr_string(fee, false),
 				amount_to_hr_string(self.amount + self.fee, false)
 			);
-			info!(LOGGER, "{}", reason);
+			info!("{}", reason);
 			return Err(ErrorKind::Fee(reason.to_string()))?;
 		}
 
@@ -304,6 +306,7 @@ impl Slate {
 					p.part_sig.as_ref().unwrap(),
 					&self.pub_nonce_sum(secp)?,
 					&p.public_blind_excess,
+					Some(&self.pub_blind_sum(secp)?),
 					self.fee,
 					self.lock_height,
 				)?;
@@ -348,6 +351,7 @@ impl Slate {
 			&keychain.secp(),
 			&final_sig,
 			&final_pubkey,
+			Some(&final_pubkey),
 			self.fee,
 			self.lock_height,
 		)?;
@@ -391,7 +395,7 @@ impl Slate {
 		final_tx.kernels_mut()[0].excess_sig = final_sig.clone();
 
 		// confirm the kernel verifies successfully before proceeding
-		debug!(LOGGER, "Validating final transaction");
+		debug!("Validating final transaction");
 		final_tx.kernels()[0].verify()?;
 
 		// confirm the overall transaction is valid (including the updated kernel)

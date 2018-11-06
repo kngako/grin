@@ -23,7 +23,8 @@ extern crate rand;
 
 use chrono::Duration;
 use std::fs;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use util::RwLock;
 
 use chain::types::NoopAdapter;
 use chain::Chain;
@@ -33,7 +34,7 @@ use core::core::{Block, BlockHeader, OutputFeatures, OutputIdentifier, Transacti
 use core::global::ChainTypes;
 use core::pow::Difficulty;
 use core::{consensus, global, pow};
-use keychain::{ExtKeychain, Keychain};
+use keychain::{ExtKeychain, ExtKeychainPath, Keychain};
 use wallet::libtx::{self, build};
 
 fn clean_output_dir(dir_name: &str) {
@@ -64,22 +65,30 @@ fn mine_empty_chain() {
 
 	for n in 1..4 {
 		let prev = chain.head_header().unwrap();
-		let difficulty = consensus::next_difficulty(chain.difficulty_iter()).unwrap();
-		let pk = keychain.derive_key_id(n as u32).unwrap();
+		let next_header_info = consensus::next_difficulty(1, chain.difficulty_iter());
+		let pk = ExtKeychainPath::new(1, n as u32, 0, 0, 0).to_identifier();
 		let reward = libtx::reward::output(&keychain, &pk, 0, prev.height).unwrap();
-		let mut b = core::core::Block::new(&prev, vec![], difficulty.clone(), reward).unwrap();
+		let mut b =
+			core::core::Block::new(&prev, vec![], next_header_info.clone().difficulty, reward)
+				.unwrap();
 		b.header.timestamp = prev.timestamp + Duration::seconds(60);
+		b.header.pow.secondary_scaling = next_header_info.secondary_scaling;
 
-		chain.set_txhashset_roots(&mut b, false).unwrap();
+		chain.set_txhashset_roots(&mut b).unwrap();
 
-		let sizeshift = if n == 2 {
-			global::min_sizeshift() + 1
+		let edge_bits = if n == 2 {
+			global::min_edge_bits() + 1
 		} else {
-			global::min_sizeshift()
+			global::min_edge_bits()
 		};
-		b.header.pow.proof.cuckoo_sizeshift = sizeshift;
-		pow::pow_size(&mut b.header, difficulty, global::proofsize(), sizeshift).unwrap();
-		b.header.pow.proof.cuckoo_sizeshift = sizeshift;
+		b.header.pow.proof.edge_bits = edge_bits;
+		pow::pow_size(
+			&mut b.header,
+			next_header_info.difficulty,
+			global::proofsize(),
+			edge_bits,
+		).unwrap();
+		b.header.pow.proof.edge_bits = edge_bits;
 
 		let bhash = b.hash();
 		chain.process_block(b, chain::Options::MINE).unwrap();
@@ -192,45 +201,35 @@ fn longer_fork() {
 	// then send back on the 1st
 	let genesis = pow::mine_genesis_block().unwrap();
 	let chain = setup(".grin4", genesis.clone());
-	let chain_fork = setup(".grin5", genesis);
 
 	// add blocks to both chains, 20 on the main one, only the first 5
 	// for the forked chain
 	let mut prev = chain.head_header().unwrap();
 	for n in 0..10 {
 		let b = prepare_block(&kc, &prev, &chain, 2 * n + 2);
-		let bh = b.header.clone();
-
-		if n < 5 {
-			chain_fork
-				.process_block(b.clone(), chain::Options::SKIP_POW)
-				.unwrap();
-		}
-
+		prev = b.header.clone();
 		chain.process_block(b, chain::Options::SKIP_POW).unwrap();
-		prev = bh;
 	}
 
-	// check both chains are in the expected state
+	let forked_block = chain.get_header_by_height(5).unwrap();
+
 	let head = chain.head_header().unwrap();
 	assert_eq!(head.height, 10);
 	assert_eq!(head.hash(), prev.hash());
-	let head_fork = chain_fork.head_header().unwrap();
-	assert_eq!(head_fork.height, 5);
 
-	let mut prev_fork = head_fork.clone();
+	let mut prev = forked_block;
 	for n in 0..7 {
-		let b_fork = prepare_block(&kc, &prev_fork, &chain_fork, 2 * n + 11);
-		let bh_fork = b_fork.header.clone();
-
-		let b = b_fork.clone();
+		let b = prepare_fork_block(&kc, &prev, &chain, 2 * n + 11);
+		prev = b.header.clone();
 		chain.process_block(b, chain::Options::SKIP_POW).unwrap();
-
-		chain_fork
-			.process_block(b_fork, chain::Options::SKIP_POW)
-			.unwrap();
-		prev_fork = bh_fork;
 	}
+
+	let new_head = prev;
+
+	// After all this the chain should have switched to the fork.
+	let head = chain.head_header().unwrap();
+	assert_eq!(head.height, 12);
+	assert_eq!(head.hash(), new_head.hash());
 }
 
 #[test]
@@ -262,11 +261,14 @@ fn spend_in_fork_and_compact() {
 
 	// Check the height of the "fork block".
 	assert_eq!(fork_head.height, 4);
+	let key_id2 = ExtKeychainPath::new(1, 2, 0, 0, 0).to_identifier();
+	let key_id30 = ExtKeychainPath::new(1, 30, 0, 0, 0).to_identifier();
+	let key_id31 = ExtKeychainPath::new(1, 31, 0, 0, 0).to_identifier();
 
 	let tx1 = build::transaction(
 		vec![
-			build::coinbase_input(consensus::REWARD, kc.derive_key_id(2).unwrap()),
-			build::output(consensus::REWARD - 20000, kc.derive_key_id(30).unwrap()),
+			build::coinbase_input(consensus::REWARD, key_id2.clone()),
+			build::output(consensus::REWARD - 20000, key_id30.clone()),
 			build::with_fee(20000),
 		],
 		&kc,
@@ -281,8 +283,8 @@ fn spend_in_fork_and_compact() {
 
 	let tx2 = build::transaction(
 		vec![
-			build::input(consensus::REWARD - 20000, kc.derive_key_id(30).unwrap()),
-			build::output(consensus::REWARD - 40000, kc.derive_key_id(31).unwrap()),
+			build::input(consensus::REWARD - 20000, key_id30.clone()),
+			build::output(consensus::REWARD - 40000, key_id31.clone()),
 			build::with_fee(20000),
 		],
 		&kc,
@@ -376,23 +378,31 @@ fn output_header_mappings() {
 
 	for n in 1..15 {
 		let prev = chain.head_header().unwrap();
-		let difficulty = consensus::next_difficulty(chain.difficulty_iter()).unwrap();
-		let pk = keychain.derive_key_id(n as u32).unwrap();
+		let next_header_info = consensus::next_difficulty(1, chain.difficulty_iter());
+		let pk = ExtKeychainPath::new(1, n as u32, 0, 0, 0).to_identifier();
 		let reward = libtx::reward::output(&keychain, &pk, 0, prev.height).unwrap();
 		reward_outputs.push(reward.0.clone());
-		let mut b = core::core::Block::new(&prev, vec![], difficulty.clone(), reward).unwrap();
+		let mut b =
+			core::core::Block::new(&prev, vec![], next_header_info.clone().difficulty, reward)
+				.unwrap();
 		b.header.timestamp = prev.timestamp + Duration::seconds(60);
+		b.header.pow.secondary_scaling = next_header_info.secondary_scaling;
 
-		chain.set_txhashset_roots(&mut b, false).unwrap();
+		chain.set_txhashset_roots(&mut b).unwrap();
 
-		let sizeshift = if n == 2 {
-			global::min_sizeshift() + 1
+		let edge_bits = if n == 2 {
+			global::min_edge_bits() + 1
 		} else {
-			global::min_sizeshift()
+			global::min_edge_bits()
 		};
-		b.header.pow.proof.cuckoo_sizeshift = sizeshift;
-		pow::pow_size(&mut b.header, difficulty, global::proofsize(), sizeshift).unwrap();
-		b.header.pow.proof.cuckoo_sizeshift = sizeshift;
+		b.header.pow.proof.edge_bits = edge_bits;
+		pow::pow_size(
+			&mut b.header,
+			next_header_info.difficulty,
+			global::proofsize(),
+			edge_bits,
+		).unwrap();
+		b.header.pow.proof.edge_bits = edge_bits;
 
 		chain.process_block(b, chain::Options::MINE).unwrap();
 
@@ -412,12 +422,13 @@ fn output_header_mappings() {
 		assert_eq!(header_for_output.height, n as u64);
 	}
 }
+
 fn prepare_block<K>(kc: &K, prev: &BlockHeader, chain: &Chain, diff: u64) -> Block
 where
 	K: Keychain,
 {
 	let mut b = prepare_block_nosum(kc, prev, diff, vec![]);
-	chain.set_txhashset_roots(&mut b, false).unwrap();
+	chain.set_txhashset_roots(&mut b).unwrap();
 	b
 }
 
@@ -432,7 +443,7 @@ where
 	K: Keychain,
 {
 	let mut b = prepare_block_nosum(kc, prev, diff, txs);
-	chain.set_txhashset_roots(&mut b, false).unwrap();
+	chain.set_txhashset_roots(&mut b).unwrap();
 	b
 }
 
@@ -441,7 +452,7 @@ where
 	K: Keychain,
 {
 	let mut b = prepare_block_nosum(kc, prev, diff, vec![]);
-	chain.set_txhashset_roots(&mut b, true).unwrap();
+	chain.set_txhashset_roots_forked(&mut b, prev).unwrap();
 	b
 }
 
@@ -456,7 +467,7 @@ where
 	K: Keychain,
 {
 	let mut b = prepare_block_nosum(kc, prev, diff, txs);
-	chain.set_txhashset_roots(&mut b, true).unwrap();
+	chain.set_txhashset_roots_forked(&mut b, prev).unwrap();
 	b
 }
 
@@ -465,7 +476,7 @@ where
 	K: Keychain,
 {
 	let proof_size = global::proofsize();
-	let key_id = kc.derive_key_id(diff as u32).unwrap();
+	let key_id = ExtKeychainPath::new(1, diff as u32, 0, 0, 0).to_identifier();
 
 	let fees = txs.iter().map(|tx| tx.fee()).sum();
 	let reward = libtx::reward::output(kc, &key_id, fees, prev.height).unwrap();
@@ -503,18 +514,17 @@ fn actual_diff_iter_output() {
 	let iter = chain.difficulty_iter();
 	let mut last_time = 0;
 	let mut first = true;
-	for i in iter.into_iter() {
-		let elem = i.unwrap();
+	for elem in iter.into_iter() {
 		if first {
-			last_time = elem.0;
+			last_time = elem.timestamp;
 			first = false;
 		}
 		println!(
 			"next_difficulty time: {}, diff: {}, duration: {} ",
-			elem.0,
-			elem.1.to_num(),
-			last_time - elem.0
+			elem.timestamp,
+			elem.difficulty.to_num(),
+			last_time - elem.timestamp
 		);
-		last_time = elem.0;
+		last_time = elem.timestamp;
 	}
 }

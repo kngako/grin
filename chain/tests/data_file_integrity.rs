@@ -24,7 +24,8 @@ extern crate rand;
 
 use chrono::Duration;
 use std::fs;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use util::RwLock;
 
 use chain::types::NoopAdapter;
 use chain::Chain;
@@ -33,7 +34,7 @@ use core::core::{Block, BlockHeader, Transaction};
 use core::global::{self, ChainTypes};
 use core::pow::{self, Difficulty};
 use core::{consensus, genesis};
-use keychain::{ExtKeychain, Keychain};
+use keychain::{ExtKeychain, ExtKeychainPath, Keychain};
 use wallet::libtx;
 
 fn clean_output_dir(dir_name: &str) {
@@ -82,22 +83,24 @@ fn data_files() {
 
 		for n in 1..4 {
 			let prev = chain.head_header().unwrap();
-			let difficulty = consensus::next_difficulty(chain.difficulty_iter()).unwrap();
-			let pk = keychain.derive_key_id(n as u32).unwrap();
+			let next_header_info = consensus::next_difficulty(1, chain.difficulty_iter());
+			let pk = ExtKeychainPath::new(1, n as u32, 0, 0, 0).to_identifier();
 			let reward = libtx::reward::output(&keychain, &pk, 0, prev.height).unwrap();
-			let mut b = core::core::Block::new(&prev, vec![], difficulty.clone(), reward).unwrap();
+			let mut b =
+				core::core::Block::new(&prev, vec![], next_header_info.clone().difficulty, reward)
+					.unwrap();
 			b.header.timestamp = prev.timestamp + Duration::seconds(60);
+			b.header.pow.secondary_scaling = next_header_info.secondary_scaling;
 
-			chain.set_txhashset_roots(&mut b, false).unwrap();
+			chain.set_txhashset_roots(&mut b).unwrap();
 
 			pow::pow_size(
 				&mut b.header,
-				difficulty,
+				next_header_info.difficulty,
 				global::proofsize(),
-				global::min_sizeshift(),
+				global::min_edge_bits(),
 			).unwrap();
 
-			let _bhash = b.hash();
 			chain
 				.process_block(b.clone(), chain::Options::MINE)
 				.unwrap();
@@ -114,7 +117,7 @@ fn data_files() {
 
 fn _prepare_block(kc: &ExtKeychain, prev: &BlockHeader, chain: &Chain, diff: u64) -> Block {
 	let mut b = _prepare_block_nosum(kc, prev, diff, vec![]);
-	chain.set_txhashset_roots(&mut b, false).unwrap();
+	chain.set_txhashset_roots(&mut b).unwrap();
 	b
 }
 
@@ -126,13 +129,13 @@ fn _prepare_block_tx(
 	txs: Vec<&Transaction>,
 ) -> Block {
 	let mut b = _prepare_block_nosum(kc, prev, diff, txs);
-	chain.set_txhashset_roots(&mut b, false).unwrap();
+	chain.set_txhashset_roots(&mut b).unwrap();
 	b
 }
 
 fn _prepare_fork_block(kc: &ExtKeychain, prev: &BlockHeader, chain: &Chain, diff: u64) -> Block {
 	let mut b = _prepare_block_nosum(kc, prev, diff, vec![]);
-	chain.set_txhashset_roots(&mut b, true).unwrap();
+	chain.set_txhashset_roots_forked(&mut b, prev).unwrap();
 	b
 }
 
@@ -144,7 +147,7 @@ fn _prepare_fork_block_tx(
 	txs: Vec<&Transaction>,
 ) -> Block {
 	let mut b = _prepare_block_nosum(kc, prev, diff, txs);
-	chain.set_txhashset_roots(&mut b, true).unwrap();
+	chain.set_txhashset_roots_forked(&mut b, prev).unwrap();
 	b
 }
 
@@ -154,7 +157,7 @@ fn _prepare_block_nosum(
 	diff: u64,
 	txs: Vec<&Transaction>,
 ) -> Block {
-	let key_id = kc.derive_key_id(diff as u32).unwrap();
+	let key_id = ExtKeychainPath::new(1, diff as u32, 0, 0, 0).to_identifier();
 
 	let fees = txs.iter().map(|tx| tx.fee()).sum();
 	let reward = libtx::reward::output(kc, &key_id, fees, prev.height).unwrap();

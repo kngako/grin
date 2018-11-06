@@ -20,9 +20,10 @@
 #![deny(unused_mut)]
 #![warn(missing_docs)]
 
+extern crate dirs;
+extern crate rand;
 #[macro_use]
 extern crate serde_derive;
-extern crate dirs;
 extern crate toml;
 
 extern crate grin_p2p as p2p;

@@ -22,12 +22,12 @@ extern crate grin_wallet as wallet;
 extern crate serde_json;
 
 use chrono::Duration;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use util::Mutex;
 
 use chain::Chain;
 use core::core::{OutputFeatures, OutputIdentifier, Transaction};
 use core::{consensus, global, pow, ser};
-use wallet::file_wallet::FileWallet;
 use wallet::libwallet;
 use wallet::libwallet::types::{BlockFees, CbData, WalletClient, WalletInst};
 use wallet::lmdb_wallet::LMDBBackend;
@@ -39,13 +39,13 @@ use util::secp::pedersen;
 pub mod testclient;
 
 /// types of backends tests should iterate through
-#[derive(Clone)]
-pub enum BackendType {
-	/// File
-	FileBackend,
-	/// LMDB
-	LMDBBackend,
-}
+//#[derive(Clone)]
+//pub enum BackendType {
+//	/// File
+//	FileBackend,
+//	/// LMDB
+//	LMDBBackend,
+//}
 
 /// Get an output from the chain locally and present it back as an API output
 fn get_output_local(chain: &chain::Chain, commit: &pedersen::Commitment) -> Option<api::Output> {
@@ -86,7 +86,7 @@ fn get_outputs_by_pmmr_index_local(
 /// Adds a block with a given reward to the chain and mines it
 pub fn add_block_with_reward(chain: &Chain, txs: Vec<&Transaction>, reward: CbData) {
 	let prev = chain.head_header().unwrap();
-	let difficulty = consensus::next_difficulty(chain.difficulty_iter()).unwrap();
+	let next_header_info = consensus::next_difficulty(1, chain.difficulty_iter());
 	let out_bin = util::from_hex(reward.output).unwrap();
 	let kern_bin = util::from_hex(reward.kernel).unwrap();
 	let output = ser::deserialize(&mut &out_bin[..]).unwrap();
@@ -94,16 +94,17 @@ pub fn add_block_with_reward(chain: &Chain, txs: Vec<&Transaction>, reward: CbDa
 	let mut b = core::core::Block::new(
 		&prev,
 		txs.into_iter().cloned().collect(),
-		difficulty.clone(),
+		next_header_info.clone().difficulty,
 		(output, kernel),
 	).unwrap();
 	b.header.timestamp = prev.timestamp + Duration::seconds(60);
-	chain.set_txhashset_roots(&mut b, false).unwrap();
+	b.header.pow.secondary_scaling = next_header_info.secondary_scaling;
+	chain.set_txhashset_roots(&mut b).unwrap();
 	pow::pow_size(
 		&mut b.header,
-		difficulty,
+		next_header_info.difficulty,
 		global::proofsize(),
-		global::min_sizeshift(),
+		global::min_edge_bits(),
 	).unwrap();
 	chain.process_block(b, chain::Options::MINE).unwrap();
 	chain.validate(false).unwrap();
@@ -154,12 +155,8 @@ where
 	Ok(())
 }
 
-/// dispatch a wallet (extend later to optionally dispatch a db wallet)
-pub fn create_wallet<C, K>(
-	dir: &str,
-	client: C,
-	backend_type: BackendType,
-) -> Arc<Mutex<Box<WalletInst<C, K>>>>
+/// dispatch a db wallet
+pub fn create_wallet<C, K>(dir: &str, client: C) -> Arc<Mutex<Box<WalletInst<C, K>>>>
 where
 	C: WalletClient + 'static,
 	K: keychain::Keychain + 'static,
@@ -167,21 +164,12 @@ where
 	let mut wallet_config = WalletConfig::default();
 	wallet_config.data_file_dir = String::from(dir);
 	let _ = wallet::WalletSeed::init_file(&wallet_config);
-	let mut wallet: Box<WalletInst<C, K>> = match backend_type {
-		BackendType::FileBackend => {
-			let mut wallet: FileWallet<C, K> = FileWallet::new(wallet_config.clone(), "", client)
-				.unwrap_or_else(|e| {
-					panic!("Error creating wallet: {:?} Config: {:?}", e, wallet_config)
-				});
-			Box::new(wallet)
-		}
-		BackendType::LMDBBackend => {
-			let mut wallet: LMDBBackend<C, K> = LMDBBackend::new(wallet_config.clone(), "", client)
-				.unwrap_or_else(|e| {
-					panic!("Error creating wallet: {:?} Config: {:?}", e, wallet_config)
-				});
-			Box::new(wallet)
-		}
+	let mut wallet: Box<WalletInst<C, K>> = {
+		let mut wallet: LMDBBackend<C, K> = LMDBBackend::new(wallet_config.clone(), "", client)
+			.unwrap_or_else(|e| {
+				panic!("Error creating wallet: {:?} Config: {:?}", e, wallet_config)
+			});
+		Box::new(wallet)
 	};
 	wallet.open_with_credentials().unwrap_or_else(|e| {
 		panic!(

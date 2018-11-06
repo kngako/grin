@@ -15,9 +15,13 @@
 //! Server stat collection types, to be used by tests, logging or GUI/TUI
 //! to collect information about server status
 
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::SystemTime;
+use util::RwLock;
+
+use core::consensus::graph_weight;
+
+use chrono::prelude::*;
 
 use chain;
 use common::types::SyncStatus;
@@ -27,8 +31,6 @@ use p2p;
 /// and populated when required
 #[derive(Clone)]
 pub struct ServerStateInfo {
-	/// whether we're in a state of waiting for peers at startup
-	pub awaiting_peers: Arc<AtomicBool>,
 	/// Stratum stats
 	pub stratum_stats: Arc<RwLock<StratumStats>>,
 }
@@ -36,7 +38,6 @@ pub struct ServerStateInfo {
 impl Default for ServerStateInfo {
 	fn default() -> ServerStateInfo {
 		ServerStateInfo {
-			awaiting_peers: Arc::new(AtomicBool::new(false)),
 			stratum_stats: Arc::new(RwLock::new(StratumStats::default())),
 		}
 	}
@@ -53,8 +54,6 @@ pub struct ServerStats {
 	pub header_head: chain::Tip,
 	/// Whether we're currently syncing
 	pub sync_status: SyncStatus,
-	/// Whether we're awaiting peers
-	pub awaiting_peers: bool,
 	/// Handle to current stratum server stats
 	pub stratum_stats: StratumStats,
 	/// Peer stats
@@ -96,7 +95,7 @@ pub struct StratumStats {
 	/// current network difficulty we're working on
 	pub network_difficulty: u64,
 	/// cuckoo size used for mining
-	pub cuckoo_size: u16,
+	pub edge_bits: u16,
 	/// Individual worker status
 	pub worker_stats: Vec<WorkerStats>,
 }
@@ -127,6 +126,10 @@ pub struct DiffBlock {
 	pub time: u64,
 	/// Duration since previous block (epoch seconds)
 	pub duration: u64,
+	/// secondary scaling
+	pub secondary_scaling: u32,
+	/// is secondary
+	pub is_secondary: bool,
 }
 
 /// Struct to return relevant information about peers
@@ -144,12 +147,18 @@ pub struct PeerStats {
 	pub height: u64,
 	/// direction
 	pub direction: String,
+	/// Last time we saw a ping/pong from this peer.
+	pub last_seen: DateTime<Utc>,
+	/// Number of bytes we've sent to the peer.
+	pub sent_bytes: Option<u64>,
+	/// Number of bytes we've received from the peer.
+	pub received_bytes: Option<u64>,
 }
 
 impl StratumStats {
 	/// Calculate network hashrate
 	pub fn network_hashrate(&self) -> f64 {
-		42.0 * (self.network_difficulty as f64 / (self.cuckoo_size - 1) as f64) / 60.0
+		42.0 * (self.network_difficulty as f64 / graph_weight(self.edge_bits as u8) as f64) / 60.0
 	}
 }
 
@@ -173,9 +182,12 @@ impl PeerStats {
 			state: state.to_string(),
 			addr: addr,
 			version: peer.info.version,
-			total_difficulty: peer.info.total_difficulty.to_num(),
-			height: peer.info.height,
+			total_difficulty: peer.info.total_difficulty().to_num(),
+			height: peer.info.height(),
 			direction: direction.to_string(),
+			last_seen: peer.info.last_seen(),
+			sent_bytes: peer.sent_bytes(),
+			received_bytes: peer.received_bytes(),
 		}
 	}
 }
@@ -202,7 +214,7 @@ impl Default for StratumStats {
 			num_workers: 0,
 			block_height: 0,
 			network_difficulty: 1000,
-			cuckoo_size: 30,
+			edge_bits: 29,
 			worker_stats: Vec::new(),
 		}
 	}

@@ -25,10 +25,92 @@ use libc::{ftruncate as ftruncate64, off_t as off64_t};
 #[cfg(any(target_os = "linux"))]
 use libc::{ftruncate64, off64_t};
 
-use core::ser;
+use core::core::hash::Hash;
+use core::ser::{self, FixedLength};
 
 /// A no-op function for doing nothing with some pruned data.
 pub fn prune_noop(_pruned_data: &[u8]) {}
+
+/// Hash file (MMR) wrapper around an append only file.
+pub struct HashFile {
+	file: AppendOnlyFile,
+}
+
+impl HashFile {
+	/// Open (or create) a hash file at the provided path on disk.
+	pub fn open(path: &str) -> io::Result<HashFile> {
+		let file = AppendOnlyFile::open(path)?;
+		Ok(HashFile { file })
+	}
+
+	/// Append a hash to this hash file.
+	/// Will not be written to disk until flush() is subsequently called.
+	/// Alternatively discard() may be called to discard any pending changes.
+	pub fn append(&mut self, hash: &Hash) -> io::Result<()> {
+		let mut bytes = ser::ser_vec(hash).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+		self.file.append(&mut bytes);
+		Ok(())
+	}
+
+	/// Read a hash from the hash file by position.
+	pub fn read(&self, position: u64) -> Option<Hash> {
+		// The MMR starts at 1, our binary backend starts at 0.
+		let pos = position - 1;
+
+		// Must be on disk, doing a read at the correct position
+		let file_offset = (pos as usize) * Hash::LEN;
+		let data = self.file.read(file_offset, Hash::LEN);
+		match ser::deserialize(&mut &data[..]) {
+			Ok(h) => Some(h),
+			Err(e) => {
+				error!(
+					"Corrupted storage, could not read an entry from hash file: {:?}",
+					e
+				);
+				None
+			}
+		}
+	}
+
+	/// Rewind the backend file to the specified position.
+	pub fn rewind(&mut self, position: u64) -> io::Result<()> {
+		self.file.rewind(position * Hash::LEN as u64);
+		Ok(())
+	}
+
+	/// Flush unsynced changes to the hash file to disk.
+	pub fn flush(&mut self) -> io::Result<()> {
+		self.file.flush()
+	}
+
+	/// Discard any unsynced changes to the hash file.
+	pub fn discard(&mut self) {
+		self.file.discard()
+	}
+
+	/// Size of the hash file in number of hashes (not bytes).
+	pub fn size(&self) -> u64 {
+		self.file.size() / Hash::LEN as u64
+	}
+
+	/// Size of the unsync'd hash file, in hashes (not bytes).
+	pub fn size_unsync(&self) -> u64 {
+		self.file.size_unsync() / Hash::LEN as u64
+	}
+
+	/// Rewrite the hash file out to disk, pruning removed hashes.
+	pub fn save_prune<T>(&self, target: String, prune_offs: &[u64], prune_cb: T) -> io::Result<()>
+	where
+		T: Fn(&[u8]),
+	{
+		let prune_offs = prune_offs
+			.iter()
+			.map(|x| x * Hash::LEN as u64)
+			.collect::<Vec<_>>();
+		self.file
+			.save_prune(target, prune_offs.as_slice(), Hash::LEN as u64, prune_cb)
+	}
+}
 
 /// Wrapper for a file that can be read at any position (random read) but for
 /// which writes are append only. Reads are backed by a memory map (mmap(2)),
@@ -49,26 +131,25 @@ pub struct AppendOnlyFile {
 
 impl AppendOnlyFile {
 	/// Open a file (existing or not) as append-only, backed by a mmap.
-	pub fn open(path: String) -> io::Result<AppendOnlyFile> {
+	pub fn open(path: &str) -> io::Result<AppendOnlyFile> {
 		let file = OpenOptions::new()
 			.read(true)
 			.append(true)
 			.create(true)
-			.open(path.clone())?;
+			.open(&path)?;
 		let mut aof = AppendOnlyFile {
-			path: path.clone(),
-			file: file,
+			file,
+			path: path.to_string(),
 			mmap: None,
 			buffer_start: 0,
 			buffer: vec![],
 			buffer_start_bak: 0,
 		};
-		// if we have a non-empty file then mmap it.
-		if let Ok(sz) = aof.size() {
-			if sz > 0 {
-				aof.buffer_start = sz as usize;
-				aof.mmap = Some(unsafe { memmap::Mmap::map(&aof.file)? });
-			}
+		// If we have a non-empty file then mmap it.
+		let sz = aof.size();
+		if sz > 0 {
+			aof.buffer_start = sz as usize;
+			aof.mmap = Some(unsafe { memmap::Mmap::map(&aof.file)? });
 		}
 		Ok(aof)
 	}
@@ -114,7 +195,7 @@ impl AppendOnlyFile {
 		}
 
 		self.buffer_start += self.buffer.len();
-		self.file.write(&self.buffer[..])?;
+		self.file.write_all(&self.buffer[..])?;
 		self.file.sync_all()?;
 
 		self.buffer = vec![];
@@ -152,7 +233,7 @@ impl AppendOnlyFile {
 			let buffer_offset = offset - self.buffer_start;
 			return self.read_from_buffer(buffer_offset, length);
 		}
-		if let None = self.mmap {
+		if self.mmap.is_none() {
 			return vec![];
 		}
 		let mmap = self.mmap.as_ref().unwrap();
@@ -191,7 +272,7 @@ impl AppendOnlyFile {
 	pub fn save_prune<T>(
 		&self,
 		target: String,
-		prune_offs: Vec<u64>,
+		prune_offs: &[u64],
 		prune_len: u64,
 		prune_cb: T,
 	) -> io::Result<()>
@@ -199,11 +280,11 @@ impl AppendOnlyFile {
 		T: Fn(&[u8]),
 	{
 		if prune_offs.is_empty() {
-			fs::copy(self.path.clone(), target.clone())?;
+			fs::copy(&self.path, &target)?;
 			Ok(())
 		} else {
-			let mut reader = File::open(self.path.clone())?;
-			let mut writer = BufWriter::new(File::create(target.clone())?);
+			let mut reader = File::open(&self.path)?;
+			let mut writer = BufWriter::new(File::create(&target)?);
 
 			// align the buffer on prune_len to avoid misalignments
 			let mut buf = vec![0; (prune_len * 256) as usize];
@@ -235,15 +316,20 @@ impl AppendOnlyFile {
 						break;
 					}
 				}
-				writer.write_all(&mut buf[buf_start..(len as usize)])?;
+				writer.write_all(&buf[buf_start..(len as usize)])?;
 				read += len;
 			}
 		}
 	}
 
 	/// Current size of the file in bytes.
-	pub fn size(&self) -> io::Result<u64> {
-		fs::metadata(&self.path).map(|md| md.len())
+	pub fn size(&self) -> u64 {
+		fs::metadata(&self.path).map(|md| md.len()).unwrap_or(0)
+	}
+
+	/// Current size of the (unsynced) file in bytes.
+	pub fn size_unsync(&self) -> u64 {
+		(self.buffer_start + self.buffer.len()) as u64
 	}
 
 	/// Path of the underlying file
@@ -253,14 +339,14 @@ impl AppendOnlyFile {
 }
 
 /// Read an ordered vector of scalars from a file.
-pub fn read_ordered_vec<T>(path: String, elmt_len: usize) -> io::Result<Vec<T>>
+pub fn read_ordered_vec<T>(path: &str, elmt_len: usize) -> io::Result<Vec<T>>
 where
 	T: ser::Readable + cmp::Ord,
 {
 	let file_path = Path::new(&path);
 	let mut ovec = Vec::with_capacity(1000);
 	if file_path.exists() {
-		let mut file = BufReader::with_capacity(elmt_len * 1000, File::open(path.clone())?);
+		let mut file = BufReader::with_capacity(elmt_len * 1000, File::open(&path)?);
 		loop {
 			// need a block to end mutable borrow before consume
 			let buf_len = {
@@ -291,7 +377,7 @@ where
 }
 
 /// Writes an ordered vector to a file
-pub fn write_vec<T>(path: String, v: &Vec<T>) -> io::Result<()>
+pub fn write_vec<T>(path: &str, v: &Vec<T>) -> io::Result<()>
 where
 	T: ser::Writeable,
 {

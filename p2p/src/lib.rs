@@ -37,7 +37,7 @@ extern crate serde;
 #[macro_use]
 extern crate serde_derive;
 #[macro_use]
-extern crate slog;
+extern crate log;
 extern crate chrono;
 
 mod conn;
@@ -50,6 +50,7 @@ mod serv;
 mod store;
 pub mod types;
 
+pub use conn::SEND_CHANNEL_CAP;
 pub use peer::Peer;
 pub use peers::Peers;
 pub use serv::{DummyAdapter, Server};

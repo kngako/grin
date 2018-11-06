@@ -20,13 +20,14 @@ use std::collections::HashSet;
 use std::fmt;
 use std::iter::FromIterator;
 use std::mem;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use util::RwLock;
 
 use consensus::{self, reward, REWARD};
 use core::committed::{self, Committed};
 use core::compact_block::{CompactBlock, CompactBlockBody};
-use core::hash::{Hash, HashWriter, Hashed, ZERO_HASH};
-use core::verifier_cache::{LruVerifierCache, VerifierCache};
+use core::hash::{Hash, Hashed, ZERO_HASH};
+use core::verifier_cache::VerifierCache;
 use core::{
 	transaction, Commitment, Input, KernelFeatures, Output, OutputFeatures, Transaction,
 	TransactionBody, TxKernel,
@@ -34,8 +35,8 @@ use core::{
 use global;
 use keychain::{self, BlindingFactor};
 use pow::{Difficulty, Proof, ProofOfWork};
-use ser::{self, Readable, Reader, Writeable, Writer};
-use util::{secp, secp_static, static_secp_instance, LOGGER};
+use ser::{self, HashOnlyPMMRable, Readable, Reader, Writeable, Writer};
+use util::{secp, static_secp_instance};
 
 /// Errors thrown by Block validation
 #[derive(Debug, Clone, Eq, PartialEq, Fail)]
@@ -117,7 +118,9 @@ pub struct BlockHeader {
 	/// Height of this block since the genesis block (height 0)
 	pub height: u64,
 	/// Hash of the block previous to this in the chain.
-	pub previous: Hash,
+	pub prev_hash: Hash,
+	/// Root hash of the header MMR at the previous header.
+	pub prev_root: Hash,
 	/// Timestamp at which the block was built.
 	pub timestamp: DateTime<Utc>,
 	/// Merklish root of all the commitments in the TxHashSet
@@ -130,9 +133,6 @@ pub struct BlockHeader {
 	/// We can derive the kernel offset sum for *this* block from
 	/// the total kernel offset of the previous block header.
 	pub total_kernel_offset: BlindingFactor,
-	/// Total accumulated sum of kernel commitments since genesis block.
-	/// Should always equal the UTXO commitment sum minus supply.
-	pub total_kernel_sum: Commitment,
 	/// Total size of the output MMR after applying this block
 	pub output_mmr_size: u64,
 	/// Total size of the kernel MMR after applying this block
@@ -142,34 +142,26 @@ pub struct BlockHeader {
 }
 
 /// Serialized size of fixed part of a BlockHeader, i.e. without pow
-fn fixed_size_of_serialized_header(version: u16) -> usize {
+fn fixed_size_of_serialized_header(_version: u16) -> usize {
 	let mut size: usize = 0;
 	size += mem::size_of::<u16>(); // version
 	size += mem::size_of::<u64>(); // height
-	size += mem::size_of::<Hash>(); // previous
-	size += mem::size_of::<u64>(); // timestamp
-	size += mem::size_of::<Hash>(); // output_root
-	size += mem::size_of::<Hash>(); // range_proof_root
-	size += mem::size_of::<Hash>(); // kernel_root
+	size += mem::size_of::<i64>(); // timestamp
+	size += 5 * mem::size_of::<Hash>(); // prev_hash, prev_root, output_root, range_proof_root, kernel_root
 	size += mem::size_of::<BlindingFactor>(); // total_kernel_offset
-	size += mem::size_of::<Commitment>(); // total_kernel_sum
-	size += mem::size_of::<u64>(); // output_mmr_size
-	size += mem::size_of::<u64>(); // kernel_mmr_size
+	size += 2 * mem::size_of::<u64>(); // output_mmr_size, kernel_mmr_size
 	size += mem::size_of::<Difficulty>(); // total_difficulty
-	if version >= 2 {
-		size += mem::size_of::<u64>(); // scaling_difficulty
-	}
+	size += mem::size_of::<u32>(); // secondary_scaling
 	size += mem::size_of::<u64>(); // nonce
 	size
 }
 
 /// Serialized size of a BlockHeader
-pub fn serialized_size_of_header(version: u16, cuckoo_sizeshift: u8) -> usize {
+pub fn serialized_size_of_header(version: u16, edge_bits: u8) -> usize {
 	let mut size = fixed_size_of_serialized_header(version);
 
-	size += mem::size_of::<u8>(); // pow.cuckoo_sizeshift
-	let nonce_bits = cuckoo_sizeshift as usize - 1;
-	let bitvec_len = global::proofsize() * nonce_bits;
+	size += mem::size_of::<u8>(); // pow.edge_bits
+	let bitvec_len = global::proofsize() * edge_bits as usize;
 	size += bitvec_len / 8; // pow.nonces
 	if bitvec_len % 8 != 0 {
 		size += 1;
@@ -182,19 +174,21 @@ impl Default for BlockHeader {
 		BlockHeader {
 			version: 1,
 			height: 0,
-			previous: ZERO_HASH,
 			timestamp: DateTime::<Utc>::from_utc(NaiveDateTime::from_timestamp(0, 0), Utc),
+			prev_hash: ZERO_HASH,
+			prev_root: ZERO_HASH,
 			output_root: ZERO_HASH,
 			range_proof_root: ZERO_HASH,
 			kernel_root: ZERO_HASH,
 			total_kernel_offset: BlindingFactor::zero(),
-			total_kernel_sum: Commitment::from_vec(vec![0; 33]),
 			output_mmr_size: 0,
 			kernel_mmr_size: 0,
 			pow: ProofOfWork::default(),
 		}
 	}
 }
+
+impl HashOnlyPMMRable for BlockHeader {}
 
 /// Serialization of a block header
 impl Writeable for BlockHeader {
@@ -210,23 +204,15 @@ impl Writeable for BlockHeader {
 /// Deserialization of a block header
 impl Readable for BlockHeader {
 	fn read(reader: &mut Reader) -> Result<BlockHeader, ser::Error> {
-		let (version, height) = ser_multiread!(reader, read_u16, read_u64);
-		let previous = Hash::read(reader)?;
-		let timestamp = reader.read_i64()?;
-		let mut total_difficulty = None;
-		if version == 1 {
-			total_difficulty = Some(Difficulty::read(reader)?);
-		}
+		let (version, height, timestamp) = ser_multiread!(reader, read_u16, read_u64, read_i64);
+		let prev_hash = Hash::read(reader)?;
+		let prev_root = Hash::read(reader)?;
 		let output_root = Hash::read(reader)?;
 		let range_proof_root = Hash::read(reader)?;
 		let kernel_root = Hash::read(reader)?;
 		let total_kernel_offset = BlindingFactor::read(reader)?;
-		let total_kernel_sum = Commitment::read(reader)?;
 		let (output_mmr_size, kernel_mmr_size) = ser_multiread!(reader, read_u64, read_u64);
-		let mut pow = ProofOfWork::read(version, reader)?;
-		if version == 1 {
-			pow.total_difficulty = total_difficulty.unwrap();
-		}
+		let pow = ProofOfWork::read(version, reader)?;
 
 		if timestamp > MAX_DATE.and_hms(0, 0, 0).timestamp()
 			|| timestamp < MIN_DATE.and_hms(0, 0, 0).timestamp()
@@ -237,13 +223,13 @@ impl Readable for BlockHeader {
 		Ok(BlockHeader {
 			version,
 			height,
-			previous,
 			timestamp: DateTime::<Utc>::from_utc(NaiveDateTime::from_timestamp(timestamp, 0), Utc),
+			prev_hash,
+			prev_root,
 			output_root,
 			range_proof_root,
 			kernel_root,
 			total_kernel_offset,
-			total_kernel_sum,
 			output_mmr_size,
 			kernel_mmr_size,
 			pow,
@@ -258,41 +244,37 @@ impl BlockHeader {
 			writer,
 			[write_u16, self.version],
 			[write_u64, self.height],
-			[write_fixed_bytes, &self.previous],
-			[write_i64, self.timestamp.timestamp()]
-		);
-		if self.version == 1 {
-			// written as part of the ProofOfWork in later versions
-			writer.write_u64(self.pow.total_difficulty.to_num())?;
-		}
-		ser_multiwrite!(
-			writer,
+			[write_i64, self.timestamp.timestamp()],
+			[write_fixed_bytes, &self.prev_hash],
+			[write_fixed_bytes, &self.prev_root],
 			[write_fixed_bytes, &self.output_root],
 			[write_fixed_bytes, &self.range_proof_root],
 			[write_fixed_bytes, &self.kernel_root],
 			[write_fixed_bytes, &self.total_kernel_offset],
-			[write_fixed_bytes, &self.total_kernel_sum],
 			[write_u64, self.output_mmr_size],
 			[write_u64, self.kernel_mmr_size]
 		);
 		Ok(())
 	}
 
-	/// Returns the pre-pow hash, as the post-pow hash
-	/// should just be the hash of the POW
-	pub fn pre_pow_hash(&self) -> Hash {
-		let mut hasher = HashWriter::default();
-		self.write_pre_pow(&mut hasher).unwrap();
-		self.pow.write_pre_pow(self.version, &mut hasher).unwrap();
-		hasher.write_u64(self.pow.nonce).unwrap();
-		let mut ret = [0; 32];
-		hasher.finalize(&mut ret);
-		Hash(ret)
+	/// Return the pre-pow, unhashed
+	/// Let the cuck(at)oo miner/verifier handle the hashing
+	/// for consistency with how this call is performed everywhere
+	/// else
+	pub fn pre_pow(&self) -> Vec<u8> {
+		let mut header_buf = vec![];
+		{
+			let mut writer = ser::BinWriter::new(&mut header_buf);
+			self.write_pre_pow(&mut writer).unwrap();
+			self.pow.write_pre_pow(self.version, &mut writer).unwrap();
+			writer.write_u64(self.pow.nonce).unwrap();
+		}
+		header_buf
 	}
 
 	/// Total difficulty accumulated by the proof of work on this header
 	pub fn total_difficulty(&self) -> Difficulty {
-		self.pow.total_difficulty.clone()
+		self.pow.total_difficulty
 	}
 
 	/// The "overage" to use when verifying the kernel sums.
@@ -316,8 +298,8 @@ impl BlockHeader {
 	pub fn serialized_size(&self) -> usize {
 		let mut size = fixed_size_of_serialized_header(self.version);
 
-		size += mem::size_of::<u8>(); // pow.cuckoo_sizeshift
-		let nonce_bits = self.pow.cuckoo_sizeshift() as usize - 1;
+		size += mem::size_of::<u8>(); // pow.edge_bits
+		let nonce_bits = self.pow.edge_bits() as usize;
 		let bitvec_len = global::proofsize() * nonce_bits;
 		size += bitvec_len / 8; // pow.nonces
 		if bitvec_len % 8 != 0 {
@@ -368,10 +350,7 @@ impl Readable for Block {
 		body.validate_read(true)
 			.map_err(|_| ser::Error::CorruptedData)?;
 
-		Ok(Block {
-			header: header,
-			body: body,
-		})
+		Ok(Block { header, body })
 	}
 }
 
@@ -415,15 +394,8 @@ impl Block {
 		difficulty: Difficulty,
 		reward_output: (Output, TxKernel),
 	) -> Result<Block, Error> {
-		let verifier_cache = Arc::new(RwLock::new(LruVerifierCache::new()));
-		let mut block = Block::with_reward(
-			prev,
-			txs,
-			reward_output.0,
-			reward_output.1,
-			difficulty,
-			verifier_cache,
-		)?;
+		let mut block =
+			Block::with_reward(prev, txs, reward_output.0, reward_output.1, difficulty)?;
 
 		// Now set the pow on the header so block hashing works as expected.
 		{
@@ -438,12 +410,7 @@ impl Block {
 	/// Note: caller must validate the block themselves, we do not validate it
 	/// here.
 	pub fn hydrate_from(cb: CompactBlock, txs: Vec<Transaction>) -> Result<Block, Error> {
-		trace!(
-			LOGGER,
-			"block: hydrate_from: {}, {} txs",
-			cb.hash(),
-			txs.len(),
-		);
+		trace!("block: hydrate_from: {}, {} txs", cb.hash(), txs.len(),);
 
 		let header = cb.header.clone();
 
@@ -483,7 +450,7 @@ impl Block {
 	/// Build a new empty block from a specified header
 	pub fn with_header(header: BlockHeader) -> Block {
 		Block {
-			header: header,
+			header,
 			..Default::default()
 		}
 	}
@@ -497,51 +464,30 @@ impl Block {
 		reward_out: Output,
 		reward_kern: TxKernel,
 		difficulty: Difficulty,
-		verifier: Arc<RwLock<VerifierCache>>,
 	) -> Result<Block, Error> {
-		// A block is just a big transaction, aggregate as such.
-		// Note that aggregation also runs transaction validation
-		// and duplicate commitment checks.
-		let mut agg_tx = transaction::aggregate(txs, verifier)?;
-		// Now add the reward output and reward kernel to the aggregate tx.
-		// At this point the tx is technically invalid,
-		// but the tx body is valid if we account for the reward (i.e. as a block).
-		agg_tx = agg_tx.with_output(reward_out).with_kernel(reward_kern);
+		// A block is just a big transaction, aggregate and add the reward output
+		// and reward kernel. At this point the tx is technically invalid but the
+		// tx body is valid if we account for the reward (i.e. as a block).
+		let agg_tx = transaction::aggregate(txs)?
+			.with_output(reward_out)
+			.with_kernel(reward_kern);
 
 		// Now add the kernel offset of the previous block for a total
 		let total_kernel_offset =
 			committed::sum_kernel_offsets(vec![agg_tx.offset, prev.total_kernel_offset], vec![])?;
 
-		let total_kernel_sum = {
-			let zero_commit = secp_static::commit_to_zero_value();
-			let secp = static_secp_instance();
-			let secp = secp.lock().unwrap();
-			let mut excesses = map_vec!(agg_tx.kernels(), |x| x.excess());
-			excesses.push(prev.total_kernel_sum);
-			excesses.retain(|x| *x != zero_commit);
-			secp.commit_sum(excesses, vec![])?
-		};
-
 		let now = Utc::now().timestamp();
 		let timestamp = DateTime::<Utc>::from_utc(NaiveDateTime::from_timestamp(now, 0), Utc);
-
-		let version = if prev.height + 1 < consensus::HEADER_V2_HARD_FORK {
-			1
-		} else {
-			2
-		};
 
 		// Now build the block with all the above information.
 		// Note: We have not validated the block here.
 		// Caller must validate the block as necessary.
 		Block {
 			header: BlockHeader {
-				version,
 				height: prev.height + 1,
 				timestamp,
-				previous: prev.hash(),
+				prev_hash: prev.hash(),
 				total_kernel_offset,
-				total_kernel_sum,
 				pow: ProofOfWork {
 					total_difficulty: difficulty + prev.pow.total_difficulty,
 					..Default::default()
@@ -589,19 +535,16 @@ impl Block {
 
 	/// Sum of all fees (inputs less outputs) in the block
 	pub fn total_fees(&self) -> u64 {
-		self.body.kernels.iter().map(|p| p.fee).sum()
+		self.body
+			.kernels
+			.iter()
+			.fold(0, |acc, ref x| acc.saturating_add(x.fee))
 	}
 
 	/// Matches any output with a potential spending input, eliminating them
 	/// from the block. Provides a simple way to cut-through the block. The
 	/// elimination is stable with respect to the order of inputs and outputs.
 	/// Method consumes the block.
-	///
-	/// NOTE: exclude coinbase from cut-through process
-	/// if a block contains a new coinbase output and
-	/// is a transaction spending a previous coinbase
-	/// we do not want to cut-through (all coinbase must be preserved)
-	///
 	pub fn cut_through(self) -> Result<Block, Error> {
 		let mut inputs = self.inputs().clone();
 		let mut outputs = self.outputs().clone();
@@ -630,15 +573,31 @@ impl Block {
 		Ok(())
 	}
 
+	fn block_kernel_offset(
+		&self,
+		prev_kernel_offset: BlindingFactor,
+	) -> Result<BlindingFactor, Error> {
+		let offset = if self.header.total_kernel_offset() == prev_kernel_offset {
+			// special case when the sum hasn't changed (typically an empty block),
+			// zero isn't a valid private key but it's a valid blinding factor
+			BlindingFactor::zero()
+		} else {
+			committed::sum_kernel_offsets(
+				vec![self.header.total_kernel_offset()],
+				vec![prev_kernel_offset],
+			)?
+		};
+		Ok(offset)
+	}
+
 	/// Validates all the elements in a block that can be checked without
 	/// additional data. Includes commitment sums and kernels, Merkle
 	/// trees, reward, etc.
 	pub fn validate(
 		&self,
 		prev_kernel_offset: &BlindingFactor,
-		prev_kernel_sum: &Commitment,
 		verifier: Arc<RwLock<VerifierCache>>,
-	) -> Result<(Commitment), Error> {
+	) -> Result<Commitment, Error> {
 		self.body.validate(true, verifier)?;
 
 		self.verify_kernel_lock_heights()?;
@@ -646,25 +605,10 @@ impl Block {
 
 		// take the kernel offset for this block (block offset minus previous) and
 		// verify.body.outputs and kernel sums
-		let block_kernel_offset = if self.header.total_kernel_offset() == prev_kernel_offset.clone()
-		{
-			// special case when the sum hasn't changed (typically an empty block),
-			// zero isn't a valid private key but it's a valid blinding factor
-			BlindingFactor::zero()
-		} else {
-			committed::sum_kernel_offsets(
-				vec![self.header.total_kernel_offset()],
-				vec![prev_kernel_offset.clone()],
-			)?
-		};
-		let (_utxo_sum, kernel_sum) =
-			self.verify_kernel_sums(self.header.overage(), block_kernel_offset)?;
-
-		// check the block header's total kernel sum
-		let total_sum = committed::sum_commits(vec![kernel_sum, prev_kernel_sum.clone()], vec![])?;
-		if total_sum != self.header.total_kernel_sum {
-			return Err(Error::InvalidTotalKernelSum);
-		}
+		let (_utxo_sum, kernel_sum) = self.verify_kernel_sums(
+			self.header.overage(),
+			self.block_kernel_offset(*prev_kernel_offset)?,
+		)?;
 
 		Ok(kernel_sum)
 	}
@@ -689,13 +633,11 @@ impl Block {
 
 		{
 			let secp = static_secp_instance();
-			let secp = secp.lock().unwrap();
+			let secp = secp.lock();
 			let over_commit = secp.commit_value(reward(self.total_fees()))?;
 
-			let out_adjust_sum = secp.commit_sum(
-				cb_outs.iter().map(|x| x.commitment()).collect(),
-				vec![over_commit],
-			)?;
+			let out_adjust_sum =
+				secp.commit_sum(map_vec!(cb_outs, |x| x.commitment()), vec![over_commit])?;
 
 			let kerns_sum = secp.commit_sum(cb_kerns.iter().map(|x| x.excess).collect(), vec![])?;
 

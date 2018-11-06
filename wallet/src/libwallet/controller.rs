@@ -15,19 +15,12 @@
 //! Controller for wallet.. instantiates and handles listeners (or single-run
 //! invocations) as needed.
 //! Still experimental
-use api::{ApiServer, Handler, ResponseFuture, Router};
-use std::collections::HashMap;
-use std::marker::PhantomData;
-use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
-
+use api::{ApiServer, BasicAuthMiddleware, Handler, ResponseFuture, Router, TLSConfig};
+use core::core::Transaction;
+use failure::ResultExt;
 use futures::future::{err, ok};
 use futures::{Future, Stream};
 use hyper::{Body, Request, Response, StatusCode};
-use serde::{Deserialize, Serialize};
-use serde_json;
-
-use core::core::Transaction;
 use keychain::Keychain;
 use libtx::slate::Slate;
 use libwallet::api::{APIForeign, APIOwner};
@@ -35,10 +28,16 @@ use libwallet::types::{
 	CbData, OutputData, SendTXArgs, TxLogEntry, WalletBackend, WalletClient, WalletInfo,
 };
 use libwallet::{Error, ErrorKind};
+use serde::{Deserialize, Serialize};
+use serde_json;
+use std::collections::HashMap;
+use std::marker::PhantomData;
+use std::net::SocketAddr;
+use std::sync::Arc;
 use url::form_urlencoded;
-
 use util::secp::pedersen;
-use util::LOGGER;
+use util::to_base64;
+use util::Mutex;
 
 /// Instantiate wallet Owner API for a single-use (command line) call
 /// Return a function containing a loaded API context to call
@@ -68,7 +67,12 @@ where
 
 /// Listener version, providing same API but listening for requests on a
 /// port and wrapping the calls
-pub fn owner_listener<T: ?Sized, C, K>(wallet: Box<T>, addr: &str) -> Result<(), Error>
+pub fn owner_listener<T: ?Sized, C, K>(
+	wallet: Box<T>,
+	addr: &str,
+	api_secret: Option<String>,
+	tls_config: Option<TLSConfig>,
+) -> Result<(), Error>
 where
 	T: WalletBackend<C, K> + Send + Sync + 'static,
 	OwnerAPIHandler<T, C, K>: Handler,
@@ -79,22 +83,37 @@ where
 	let api_handler = OwnerAPIHandler::new(wallet_arc);
 
 	let mut router = Router::new();
+	if api_secret.is_some() {
+		let api_basic_auth =
+			"Basic ".to_string() + &to_base64(&("grin:".to_string() + &api_secret.unwrap()));
+		let basic_realm = "Basic realm=GrinOwnerAPI".to_string();
+		let basic_auth_middleware = Arc::new(BasicAuthMiddleware::new(api_basic_auth, basic_realm));
+		router.add_middleware(basic_auth_middleware);
+	}
 	router
-		.add_route("/v1/wallet/owner/**", Box::new(api_handler))
+		.add_route("/v1/wallet/owner/**", Arc::new(api_handler))
 		.map_err(|_| ErrorKind::GenericError("Router failed to add route".to_string()))?;
 
 	let mut apis = ApiServer::new();
-	info!(LOGGER, "Starting HTTP Owner API server at {}.", addr);
+	info!("Starting HTTP Owner API server at {}.", addr);
 	let socket_addr: SocketAddr = addr.parse().expect("unable to parse socket address");
-	apis.start(socket_addr, router).unwrap_or_else(|e| {
-		error!(LOGGER, "Failed to start API HTTP server: {}.", e);
-	});
-	Ok(())
+	let api_thread =
+		apis.start(socket_addr, router, tls_config)
+			.context(ErrorKind::GenericError(
+				"API thread failed to start".to_string(),
+			))?;
+	api_thread
+		.join()
+		.map_err(|e| ErrorKind::GenericError(format!("API thread panicked :{:?}", e)).into())
 }
 
 /// Listener version, providing same API but listening for requests on a
 /// port and wrapping the calls
-pub fn foreign_listener<T: ?Sized, C, K>(wallet: Box<T>, addr: &str) -> Result<(), Error>
+pub fn foreign_listener<T: ?Sized, C, K>(
+	wallet: Box<T>,
+	addr: &str,
+	tls_config: Option<TLSConfig>,
+) -> Result<(), Error>
 where
 	T: WalletBackend<C, K> + Send + Sync + 'static,
 	C: WalletClient + 'static,
@@ -104,16 +123,21 @@ where
 
 	let mut router = Router::new();
 	router
-		.add_route("/v1/wallet/foreign/**", Box::new(api_handler))
+		.add_route("/v1/wallet/foreign/**", Arc::new(api_handler))
 		.map_err(|_| ErrorKind::GenericError("Router failed to add route".to_string()))?;
 
 	let mut apis = ApiServer::new();
-	info!(LOGGER, "Starting HTTP Foreign API server at {}.", addr);
+	info!("Starting HTTP Foreign API server at {}.", addr);
 	let socket_addr: SocketAddr = addr.parse().expect("unable to parse socket address");
-	apis.start(socket_addr, router).unwrap_or_else(|e| {
-		error!(LOGGER, "Failed to start API HTTP server: {}.", e);
-	});
-	Ok(())
+	let api_thread =
+		apis.start(socket_addr, router, tls_config)
+			.context(ErrorKind::GenericError(
+				"API thread failed to start".to_string(),
+			))?;
+
+	api_thread
+		.join()
+		.map_err(|e| ErrorKind::GenericError(format!("API thread panicked :{:?}", e)).into())
 }
 
 type WalletResponseFuture = Box<Future<Item = Response<Body>, Error = Error> + Send>;
@@ -202,12 +226,12 @@ where
 				Ok(id) => match api.dump_stored_tx(id, false, "") {
 					Ok(tx) => Ok(tx),
 					Err(e) => {
-						error!(LOGGER, "dump_stored_tx: failed with error: {}", e);
+						error!("dump_stored_tx: failed with error: {}", e);
 						Err(e)
 					}
 				},
 				Err(e) => {
-					error!(LOGGER, "dump_stored_tx: could not parse id: {}", e);
+					error!("dump_stored_tx: could not parse id: {}", e);
 					Err(ErrorKind::TransactionDumpError(
 						"dump_stored_tx: cannot dump transaction. Could not parse id in request.",
 					).into())
@@ -239,6 +263,7 @@ where
 
 	fn handle_get_request(&self, req: &Request<Body>) -> Result<Response<Body>, Error> {
 		let api = APIOwner::new(self.wallet.clone());
+
 		Ok(match req
 			.uri()
 			.path()
@@ -282,7 +307,7 @@ where
 					args.selection_strategy_is_use_all,
 				)
 			} else {
-				error!(LOGGER, "unsupported payment method: {}", args.method);
+				error!("unsupported payment method: {}", args.method);
 				return Err(ErrorKind::ClientCallback("unsupported payment method"))?;
 			}
 		}))
@@ -297,7 +322,7 @@ where
 			parse_body(req).and_then(move |mut slate| match api.finalize_tx(&mut slate) {
 				Ok(_) => ok(slate.clone()),
 				Err(e) => {
-					error!(LOGGER, "finalize_tx: failed with error: {}", e);
+					error!("finalize_tx: failed with error: {}", e);
 					err(e)
 				}
 			}),
@@ -315,22 +340,48 @@ where
 				Ok(id) => match api.cancel_tx(id) {
 					Ok(_) => ok(()),
 					Err(e) => {
-						error!(LOGGER, "finalize_tx: failed with error: {}", e);
+						error!("cancel_tx: failed with error: {}", e);
 						err(e)
 					}
 				},
 				Err(e) => {
-					error!(LOGGER, "finalize_tx: could not parse id: {}", e);
+					error!("cancel_tx: could not parse id: {}", e);
 					err(ErrorKind::TransactionCancellationError(
-						"finalize_tx: cannot cancel transaction. Could not parse id in request.",
+						"cancel_tx: cannot cancel transaction. Could not parse id in request.",
 					).into())
 				}
 			})
 		} else {
 			Box::new(err(ErrorKind::TransactionCancellationError(
-				"finalize_tx: Cannot cancel transaction. Missing id param in request.",
+				"cancel_tx: Cannot cancel transaction. Missing id param in request.",
 			).into()))
 		}
+	}
+
+	fn post_tx(
+		&self,
+		req: Request<Body>,
+		api: APIOwner<T, C, K>,
+	) -> Box<Future<Item = (), Error = Error> + Send> {
+		let params = match req.uri().query() {
+			Some(query_string) => form_urlencoded::parse(query_string.as_bytes())
+				.into_owned()
+				.fold(HashMap::new(), |mut hm, (k, v)| {
+					hm.entry(k).or_insert(vec![]).push(v);
+					hm
+				}),
+			None => HashMap::new(),
+		};
+		let fluff = params.get("fluff").is_some();
+		Box::new(
+			parse_body(req).and_then(move |slate| match api.post_tx(&slate, fluff) {
+				Ok(_) => ok(()),
+				Err(e) => {
+					error!("post_tx: failed with error: {}", e);
+					err(e)
+				}
+			}),
+		)
 	}
 
 	fn issue_burn_tx(
@@ -367,6 +418,10 @@ where
 				self.cancel_tx(req, api)
 					.and_then(|_| ok(response(StatusCode::OK, ""))),
 			),
+			"post_tx" => Box::new(
+				self.post_tx(req, api)
+					.and_then(|_| ok(response(StatusCode::OK, ""))),
+			),
 			"issue_burn_tx" => Box::new(
 				self.issue_burn_tx(req, api)
 					.and_then(|_| ok(response(StatusCode::OK, ""))),
@@ -388,7 +443,7 @@ where
 		match self.handle_get_request(&req) {
 			Ok(r) => Box::new(ok(r)),
 			Err(e) => {
-				error!(LOGGER, "Request Error: {:?}", e);
+				error!("Request Error: {:?}", e);
 				Box::new(ok(create_error_response(e)))
 			}
 		}
@@ -399,7 +454,7 @@ where
 			self.handle_post_request(req)
 				.and_then(|r| ok(r))
 				.or_else(|e| {
-					error!(LOGGER, "Request Error: {:?}", e);
+					error!("Request Error: {:?}", e);
 					ok(create_error_response(e))
 				}),
 		)
@@ -456,7 +511,7 @@ where
 			parse_body(req).and_then(move |mut slate| match api.receive_tx(&mut slate) {
 				Ok(_) => ok(slate.clone()),
 				Err(e) => {
-					error!(LOGGER, "receive_tx: failed with error: {}", e);
+					error!("receive_tx: failed with error: {}", e);
 					err(e)
 				}
 			}),
@@ -493,7 +548,7 @@ where
 {
 	fn post(&self, req: Request<Body>) -> ResponseFuture {
 		Box::new(self.handle_request(req).and_then(|r| ok(r)).or_else(|e| {
-			error!(LOGGER, "Request Error: {:?}", e);
+			error!("Request Error: {:?}", e);
 			ok(create_error_response(e))
 		}))
 	}
