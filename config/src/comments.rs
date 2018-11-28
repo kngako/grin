@@ -212,7 +212,7 @@ fn comments() -> HashMap<String, String> {
 #until we get to at least this number
 #peer_min_preferred_count = 8
 
-# 7 = Bit flags for FULL_NODE
+# 15 = Bit flags for FULL_NODE
 #This structure needs to be changed internally, to make it more configurable
 ".to_string(),
 	);
@@ -244,6 +244,13 @@ fn comments() -> HashMap<String, String> {
 		"max_stempool_size".to_string(),
 		"
 #maximum number of transactions allowed in the stempool
+".to_string(),
+	);
+
+	retval.insert(
+		"mineable_max_weight".to_string(),
+		"
+#maximum total weight of transactions that can get selected to build a block
 ".to_string(),
 	);
 

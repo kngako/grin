@@ -19,7 +19,6 @@ use chrono::prelude::{DateTime, NaiveDateTime, Utc};
 use std::collections::HashSet;
 use std::fmt;
 use std::iter::FromIterator;
-use std::mem;
 use std::sync::Arc;
 use util::RwLock;
 
@@ -35,7 +34,7 @@ use core::{
 use global;
 use keychain::{self, BlindingFactor};
 use pow::{Difficulty, Proof, ProofOfWork};
-use ser::{self, HashOnlyPMMRable, Readable, Reader, Writeable, Writer};
+use ser::{self, PMMRable, Readable, Reader, Writeable, Writer};
 use util::{secp, static_secp_instance};
 
 /// Errors thrown by Block validation
@@ -141,34 +140,6 @@ pub struct BlockHeader {
 	pub pow: ProofOfWork,
 }
 
-/// Serialized size of fixed part of a BlockHeader, i.e. without pow
-fn fixed_size_of_serialized_header(_version: u16) -> usize {
-	let mut size: usize = 0;
-	size += mem::size_of::<u16>(); // version
-	size += mem::size_of::<u64>(); // height
-	size += mem::size_of::<i64>(); // timestamp
-	size += 5 * mem::size_of::<Hash>(); // prev_hash, prev_root, output_root, range_proof_root, kernel_root
-	size += mem::size_of::<BlindingFactor>(); // total_kernel_offset
-	size += 2 * mem::size_of::<u64>(); // output_mmr_size, kernel_mmr_size
-	size += mem::size_of::<Difficulty>(); // total_difficulty
-	size += mem::size_of::<u32>(); // secondary_scaling
-	size += mem::size_of::<u64>(); // nonce
-	size
-}
-
-/// Serialized size of a BlockHeader
-pub fn serialized_size_of_header(version: u16, edge_bits: u8) -> usize {
-	let mut size = fixed_size_of_serialized_header(version);
-
-	size += mem::size_of::<u8>(); // pow.edge_bits
-	let bitvec_len = global::proofsize() * edge_bits as usize;
-	size += bitvec_len / 8; // pow.nonces
-	if bitvec_len % 8 != 0 {
-		size += 1;
-	}
-	size
-}
-
 impl Default for BlockHeader {
 	fn default() -> BlockHeader {
 		BlockHeader {
@@ -188,7 +159,13 @@ impl Default for BlockHeader {
 	}
 }
 
-impl HashOnlyPMMRable for BlockHeader {}
+impl PMMRable for BlockHeader {
+	type E = Hash;
+
+	fn as_elmt(self) -> Self::E {
+		self.hash()
+	}
+}
 
 /// Serialization of a block header
 impl Writeable for BlockHeader {
@@ -292,20 +269,6 @@ impl BlockHeader {
 	/// Total kernel offset for the chain state up to and including this block.
 	pub fn total_kernel_offset(&self) -> BlindingFactor {
 		self.total_kernel_offset
-	}
-
-	/// Serialized size of this header
-	pub fn serialized_size(&self) -> usize {
-		let mut size = fixed_size_of_serialized_header(self.version);
-
-		size += mem::size_of::<u8>(); // pow.edge_bits
-		let nonce_bits = self.pow.edge_bits() as usize;
-		let bitvec_len = global::proofsize() * nonce_bits;
-		size += bitvec_len / 8; // pow.nonces
-		if bitvec_len % 8 != 0 {
-			size += 1;
-		}
-		size
 	}
 }
 

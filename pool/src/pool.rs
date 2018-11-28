@@ -19,17 +19,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use util::RwLock;
 
-use core::consensus;
 use core::core::hash::{Hash, Hashed};
 use core::core::id::{ShortId, ShortIdentifiable};
 use core::core::transaction;
 use core::core::verifier_cache::VerifierCache;
 use core::core::{Block, BlockHeader, BlockSums, Committed, Transaction, TxKernel};
 use types::{BlockChain, PoolEntry, PoolEntryState, PoolError};
-
-// max weight leaving minimum space for a coinbase
-const MAX_MINEABLE_WEIGHT: usize =
-	consensus::MAX_BLOCK_WEIGHT - consensus::BLOCK_OUTPUT_WEIGHT - consensus::BLOCK_KERNEL_WEIGHT;
 
 pub struct Pool {
 	/// Entries in the pool (tx + info + timer) in simple insertion order.
@@ -64,6 +59,18 @@ impl Pool {
 			.iter()
 			.find(|x| x.tx.hash() == hash)
 			.map(|x| x.tx.clone())
+	}
+
+	/// Query the tx pool for an individual tx matching the given kernel hash.
+	pub fn retrieve_tx_by_kernel_hash(&self, hash: Hash) -> Option<Transaction> {
+		for x in &self.entries {
+			for k in x.tx.kernels() {
+				if k.hash() == hash {
+					return Some(x.tx.clone());
+				}
+			}
+		}
+		None
 	}
 
 	/// Query the tx pool for all known txs based on kernel short_ids
@@ -108,7 +115,7 @@ impl Pool {
 	/// appropriate to put in a mined block. Aggregates chains of dependent
 	/// transactions, orders by fee over weight and ensures to total weight
 	/// doesn't exceed block limits.
-	pub fn prepare_mineable_transactions(&self) -> Result<Vec<Transaction>, PoolError> {
+	pub fn prepare_mineable_transactions(&self, max_weight: usize) -> Result<Vec<Transaction>, PoolError> {
 		let header = self.blockchain.chain_head()?;
 		let tx_buckets = self.bucket_transactions();
 
@@ -127,7 +134,7 @@ impl Pool {
 		let mut weight = 0;
 		flat_txs.retain(|tx| {
 			weight += tx.tx_weight_as_block() as usize;
-			weight < MAX_MINEABLE_WEIGHT
+			weight < max_weight
 		});
 
 		// Iteratively apply the txs to the current chain state,

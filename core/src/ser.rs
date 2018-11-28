@@ -19,13 +19,17 @@
 //! To use it simply implement `Writeable` or `Readable` and then use the
 //! `serialize` or `deserialize` functions on them as appropriate.
 
+use std::time::Duration;
+
 use byteorder::{BigEndian, ByteOrder, ReadBytesExt};
 use consensus;
 use core::hash::{Hash, Hashed};
 use keychain::{BlindingFactor, Identifier, IDENTIFIER_SIZE};
 use std::fmt::Debug;
 use std::io::{self, Read, Write};
-use std::{cmp, error, fmt, mem};
+use std::marker;
+use std::{cmp, error, fmt};
+use util::read_write::read_exact;
 use util::secp::constants::{
 	AGG_SIGNATURE_SIZE, MAX_PROOF_SIZE, PEDERSEN_COMMITMENT_SIZE, SECRET_KEY_SIZE,
 };
@@ -46,6 +50,8 @@ pub enum Error {
 	},
 	/// Data wasn't in a consumable format
 	CorruptedData,
+	/// Incorrect number of elements (when deserializing a vec via read_multi say).
+	CountError,
 	/// When asked to read too much data
 	TooLargeReadErr,
 	/// Consensus rule failure (currently sort order)
@@ -75,6 +81,7 @@ impl fmt::Display for Error {
 				received: ref r,
 			} => write!(f, "expected {:?}, got {:?}", e, r),
 			Error::CorruptedData => f.write_str("corrupted data"),
+			Error::CountError => f.write_str("count error"),
 			Error::TooLargeReadErr => f.write_str("too large read"),
 			Error::ConsensusError(ref e) => write!(f, "consensus error {:?}", e),
 			Error::HexError(ref e) => write!(f, "hex error {:?}", e),
@@ -95,6 +102,7 @@ impl error::Error for Error {
 			Error::IOErr(ref e, _) => e,
 			Error::UnexpectedData { .. } => "unexpected data",
 			Error::CorruptedData => "corrupted data",
+			Error::CountError => "count error",
 			Error::TooLargeReadErr => "too large read",
 			Error::ConsensusError(_) => "consensus error (sort order)",
 			Error::HexError(_) => "hex error",
@@ -184,10 +192,8 @@ pub trait Reader {
 	fn read_i32(&mut self) -> Result<i32, Error>;
 	/// Read a i64 from the underlying Read
 	fn read_i64(&mut self) -> Result<i64, Error>;
-	/// first before the data bytes.
-	fn read_vec(&mut self) -> Result<Vec<u8>, Error>;
-	/// first before the data bytes limited to max bytes.
-	fn read_limited_vec(&mut self, max: usize) -> Result<Vec<u8>, Error>;
+	/// Read a u64 len prefix followed by that number of exact bytes.
+	fn read_bytes_len_prefix(&mut self) -> Result<Vec<u8>, Error>;
 	/// Read a fixed number of bytes from the underlying reader.
 	fn read_fixed_bytes(&mut self, length: usize) -> Result<Vec<u8>, Error>;
 	/// Consumes a byte from the reader, producing an error if it doesn't have
@@ -203,17 +209,60 @@ pub trait Writeable {
 	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), Error>;
 }
 
+/// Reader that exposes an Iterator interface.
+pub struct IteratingReader<'a, T> {
+	count: u64,
+	curr: u64,
+	reader: &'a mut Reader,
+	_marker: marker::PhantomData<T>,
+}
+
+impl<'a, T> IteratingReader<'a, T> {
+	/// Constructor to create a new iterating reader for the provided underlying reader.
+	/// Takes a count so we know how many to iterate over.
+	pub fn new(reader: &'a mut Reader, count: u64) -> IteratingReader<'a, T> {
+		let curr = 0;
+		IteratingReader {
+			count,
+			curr,
+			reader,
+			_marker: marker::PhantomData,
+		}
+	}
+}
+
+impl<'a, T> Iterator for IteratingReader<'a, T>
+where
+	T: Readable,
+{
+	type Item = T;
+
+	fn next(&mut self) -> Option<T> {
+		if self.curr >= self.count {
+			return None;
+		}
+		self.curr += 1;
+		T::read(self.reader).ok()
+	}
+}
+
 /// Reads multiple serialized items into a Vec.
 pub fn read_multi<T>(reader: &mut Reader, count: u64) -> Result<Vec<T>, Error>
 where
-	T: Readable + Hashed + Writeable,
+	T: Readable,
 {
-	let elem_size = mem::size_of::<T>();
-	if count.checked_mul(elem_size as u64).is_none() {
+	// Very rudimentary check to ensure we do not overflow anything
+	// attempting to read huge amounts of data.
+	// Probably better than checking if count * size overflows a u64 though.
+	if count > 1_000_000 {
 		return Err(Error::TooLargeReadErr);
 	}
-	let result: Vec<T> = try!((0..count).map(|_| T::read(reader)).collect());
-	Ok(result)
+
+	let res: Vec<T> = IteratingReader::new(reader, count).collect();
+	if res.len() as u64 != count {
+		return Err(Error::CountError);
+	}
+	Ok(res)
 }
 
 /// Trait that every type that can be deserialized from binary must implement.
@@ -227,7 +276,7 @@ where
 	fn read(reader: &mut Reader) -> Result<Self, Error>;
 }
 
-/// Deserializes a Readeable from any std::io::Read implementation.
+/// Deserializes a Readable from any std::io::Read implementation.
 pub fn deserialize<T: Readable>(source: &mut Read) -> Result<T, Error> {
 	let mut reader = BinReader { source };
 	T::read(&mut reader)
@@ -278,26 +327,106 @@ impl<'a> Reader for BinReader<'a> {
 		self.source.read_i64::<BigEndian>().map_err(map_io_err)
 	}
 	/// Read a variable size vector from the underlying Read. Expects a usize
-	fn read_vec(&mut self) -> Result<Vec<u8>, Error> {
+	fn read_bytes_len_prefix(&mut self) -> Result<Vec<u8>, Error> {
 		let len = self.read_u64()?;
 		self.read_fixed_bytes(len as usize)
 	}
-	/// Read limited variable size vector from the underlying Read. Expects a
-	/// usize
-	fn read_limited_vec(&mut self, max: usize) -> Result<Vec<u8>, Error> {
-		let len = cmp::min(max, self.read_u64()? as usize);
-		self.read_fixed_bytes(len as usize)
-	}
-	fn read_fixed_bytes(&mut self, length: usize) -> Result<Vec<u8>, Error> {
-		// not reading more than 100k in a single read
-		if length > 100000 {
+
+	/// Read a fixed number of bytes.
+	fn read_fixed_bytes(&mut self, len: usize) -> Result<Vec<u8>, Error> {
+		// not reading more than 100k bytes in a single read
+		if len > 100_000 {
 			return Err(Error::TooLargeReadErr);
 		}
-		let mut buf = vec![0; length];
+		let mut buf = vec![0; len];
 		self.source
 			.read_exact(&mut buf)
 			.map(move |_| buf)
 			.map_err(map_io_err)
+	}
+
+	fn expect_u8(&mut self, val: u8) -> Result<u8, Error> {
+		let b = self.read_u8()?;
+		if b == val {
+			Ok(b)
+		} else {
+			Err(Error::UnexpectedData {
+				expected: vec![val],
+				received: vec![b],
+			})
+		}
+	}
+}
+
+/// A reader that reads straight off a stream.
+/// Tracks total bytes read so we can verify we read the right number afterwards.
+pub struct StreamingReader<'a> {
+	total_bytes_read: u64,
+	stream: &'a mut Read,
+	timeout: Duration,
+}
+
+impl<'a> StreamingReader<'a> {
+	/// Create a new streaming reader with the provided underlying stream.
+	/// Also takes a duration to be used for each individual read_exact call.
+	pub fn new(stream: &'a mut Read, timeout: Duration) -> StreamingReader<'a> {
+		StreamingReader {
+			total_bytes_read: 0,
+			stream,
+			timeout,
+		}
+	}
+
+	/// Returns the total bytes read via this streaming reader.
+	pub fn total_bytes_read(&self) -> u64 {
+		self.total_bytes_read
+	}
+}
+
+impl<'a> Reader for StreamingReader<'a> {
+	fn read_u8(&mut self) -> Result<u8, Error> {
+		let buf = self.read_fixed_bytes(1)?;
+		deserialize(&mut &buf[..])
+	}
+
+	fn read_u16(&mut self) -> Result<u16, Error> {
+		let buf = self.read_fixed_bytes(2)?;
+		deserialize(&mut &buf[..])
+	}
+
+	fn read_u32(&mut self) -> Result<u32, Error> {
+		let buf = self.read_fixed_bytes(4)?;
+		deserialize(&mut &buf[..])
+	}
+
+	fn read_i32(&mut self) -> Result<i32, Error> {
+		let buf = self.read_fixed_bytes(4)?;
+		deserialize(&mut &buf[..])
+	}
+
+	fn read_u64(&mut self) -> Result<u64, Error> {
+		let buf = self.read_fixed_bytes(8)?;
+		deserialize(&mut &buf[..])
+	}
+
+	fn read_i64(&mut self) -> Result<i64, Error> {
+		let buf = self.read_fixed_bytes(8)?;
+		deserialize(&mut &buf[..])
+	}
+
+	/// Read a variable size vector from the underlying stream. Expects a usize
+	fn read_bytes_len_prefix(&mut self) -> Result<Vec<u8>, Error> {
+		let len = self.read_u64()?;
+		self.total_bytes_read += 8;
+		self.read_fixed_bytes(len as usize)
+	}
+
+	/// Read a fixed number of bytes.
+	fn read_fixed_bytes(&mut self, len: usize) -> Result<Vec<u8>, Error> {
+		let mut buf = vec![0u8; len];
+		read_exact(&mut self.stream, &mut buf, self.timeout, true)?;
+		self.total_bytes_read += len as u64;
+		Ok(buf)
 	}
 
 	fn expect_u8(&mut self, val: u8) -> Result<u8, Error> {
@@ -336,9 +465,13 @@ impl Writeable for BlindingFactor {
 
 impl Readable for BlindingFactor {
 	fn read(reader: &mut Reader) -> Result<BlindingFactor, Error> {
-		let bytes = reader.read_fixed_bytes(SECRET_KEY_SIZE)?;
+		let bytes = reader.read_fixed_bytes(BlindingFactor::LEN)?;
 		Ok(BlindingFactor::from_slice(&bytes))
 	}
+}
+
+impl FixedLength for BlindingFactor {
+	const LEN: usize = SECRET_KEY_SIZE;
 }
 
 impl Writeable for Identifier {
@@ -362,27 +495,36 @@ impl Writeable for RangeProof {
 
 impl Readable for RangeProof {
 	fn read(reader: &mut Reader) -> Result<RangeProof, Error> {
-		let p = reader.read_limited_vec(MAX_PROOF_SIZE)?;
-		let mut a = [0; MAX_PROOF_SIZE];
-		a[..p.len()].clone_from_slice(&p[..]);
+		let len = reader.read_u64()?;
+		let max_len = cmp::min(len as usize, MAX_PROOF_SIZE);
+		let p = reader.read_fixed_bytes(max_len)?;
+		let mut proof = [0; MAX_PROOF_SIZE];
+		proof[..p.len()].clone_from_slice(&p[..]);
 		Ok(RangeProof {
-			proof: a,
-			plen: p.len(),
+			plen: proof.len(),
+			proof,
 		})
 	}
 }
 
 impl FixedLength for RangeProof {
-	const LEN: usize = MAX_PROOF_SIZE + 8;
+	const LEN: usize = 8 // length prefix
+		+ MAX_PROOF_SIZE;
 }
 
-impl PMMRable for RangeProof {}
+impl PMMRable for RangeProof {
+	type E = Self;
+
+	fn as_elmt(self) -> Self::E {
+		self
+	}
+}
 
 impl Readable for Signature {
 	fn read(reader: &mut Reader) -> Result<Signature, Error> {
-		let a = reader.read_fixed_bytes(AGG_SIGNATURE_SIZE)?;
-		let mut c = [0; AGG_SIGNATURE_SIZE];
-		c[..AGG_SIGNATURE_SIZE].clone_from_slice(&a[..AGG_SIGNATURE_SIZE]);
+		let a = reader.read_fixed_bytes(Signature::LEN)?;
+		let mut c = [0; Signature::LEN];
+		c[..Signature::LEN].clone_from_slice(&a[..Signature::LEN]);
 		Ok(Signature::from_raw_data(&c).unwrap())
 	}
 }
@@ -391,6 +533,10 @@ impl Writeable for Signature {
 	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), Error> {
 		writer.write_fixed_bytes(self)
 	}
+}
+
+impl FixedLength for Signature {
+	const LEN: usize = AGG_SIGNATURE_SIZE;
 }
 
 /// Utility wrapper for an underlying byte Writer. Defines higher level methods
@@ -542,11 +688,15 @@ pub trait FixedLength {
 	const LEN: usize;
 }
 
-/// Trait for types that can be added to a "hash only" PMMR (block headers for example).
-pub trait HashOnlyPMMRable: Writeable + Clone + Debug {}
-
 /// Trait for types that can be added to a PMMR.
-pub trait PMMRable: FixedLength + Readable + Writeable + Clone + Debug {}
+pub trait PMMRable: Writeable + Clone + Debug {
+	/// The type of element actually stored in the MMR data file.
+	/// This allows us to store Hash elements in the header MMR for variable size BlockHeaders.
+	type E: FixedLength + Readable + Writeable;
+
+	/// Convert the pmmrable into the element to be stored in the MMR data file.
+	fn as_elmt(self) -> Self::E;
+}
 
 /// Generic trait to ensure PMMR elements can be hashed with an index
 pub trait PMMRIndexHashable {

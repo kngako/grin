@@ -148,13 +148,17 @@ pub enum ErrorKind {
 	#[fail(display = "Wallet seed doesn't exist error")]
 	WalletSeedDoesntExist,
 
+	/// Wallet seed doesn't exist
+	#[fail(display = "Wallet seed decryption error")]
+	WalletSeedDecryption,
+
 	/// Transaction doesn't exist
 	#[fail(display = "Transaction {} doesn't exist", _0)]
-	TransactionDoesntExist(u32),
+	TransactionDoesntExist(String),
 
 	/// Transaction already rolled back
 	#[fail(display = "Transaction {} cannot be cancelled", _0)]
-	TransactionNotCancellable(u32),
+	TransactionNotCancellable(String),
 
 	/// Cancellation error
 	#[fail(display = "Cancellation Error: {}", _0)]
@@ -191,7 +195,19 @@ pub enum ErrorKind {
 
 impl Display for Error {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		Display::fmt(&self.inner, f)
+		let cause = match self.cause() {
+			Some(c) => format!("{}", c),
+			None => String::from("Unknown"),
+		};
+		let backtrace = match self.backtrace() {
+			Some(b) => format!("{}", b),
+			None => String::from("Unknown"),
+		};
+		let output = format!(
+			"{} \n Cause: {} \n Backtrace: {}",
+			self.inner, cause, backtrace
+		);
+		Display::fmt(&output, f)
 	}
 }
 

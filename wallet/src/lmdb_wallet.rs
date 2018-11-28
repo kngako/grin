@@ -60,12 +60,12 @@ pub struct LMDBBackend<C, K> {
 	pub keychain: Option<K>,
 	/// Parent path to use by default for output operations
 	parent_key_id: Identifier,
-	/// client
-	client: C,
+	/// wallet to node client
+	w2n_client: C,
 }
 
 impl<C, K> LMDBBackend<C, K> {
-	pub fn new(config: WalletConfig, passphrase: &str, client: C) -> Result<Self, Error> {
+	pub fn new(config: WalletConfig, passphrase: &str, n_client: C) -> Result<Self, Error> {
 		let db_path = path::Path::new(&config.data_file_dir).join(DB_DIR);
 		fs::create_dir_all(&db_path).expect("Couldn't create wallet backend directory!");
 
@@ -94,7 +94,7 @@ impl<C, K> LMDBBackend<C, K> {
 			passphrase: String::from(passphrase),
 			keychain: None,
 			parent_key_id: LMDBBackend::<C, K>::default_path(),
-			client: client,
+			w2n_client: n_client,
 		};
 		Ok(res)
 	}
@@ -116,17 +116,15 @@ impl<C, K> LMDBBackend<C, K> {
 
 impl<C, K> WalletBackend<C, K> for LMDBBackend<C, K>
 where
-	C: WalletClient,
+	C: NodeClient,
 	K: Keychain,
 {
 	/// Initialise with whatever stored credentials we have
 	fn open_with_credentials(&mut self) -> Result<(), Error> {
-		let wallet_seed = WalletSeed::from_file(&self.config)
+		let wallet_seed = WalletSeed::from_file(&self.config, &self.passphrase)
 			.context(ErrorKind::CallbackImpl("Error opening wallet"))?;
-		let keychain = wallet_seed.derive_keychain(&self.passphrase);
+		let keychain = wallet_seed.derive_keychain();
 		self.keychain = Some(keychain.context(ErrorKind::CallbackImpl("Error deriving keychain"))?);
-		// Just blow up password for now after it's been used
-		self.passphrase = String::from("");
 		Ok(())
 	}
 
@@ -141,9 +139,9 @@ where
 		self.keychain.as_mut().unwrap()
 	}
 
-	/// Return the client being used
-	fn client(&mut self) -> &mut C {
-		&mut self.client
+	/// Return the node client being used
+	fn w2n_client(&mut self) -> &mut C {
+		&mut self.w2n_client
 	}
 
 	/// Set parent path by account name
@@ -280,7 +278,7 @@ where
 /// discarded on error.
 pub struct Batch<'a, C: 'a, K: 'a>
 where
-	C: WalletClient,
+	C: NodeClient,
 	K: Keychain,
 {
 	_store: &'a LMDBBackend<C, K>,
@@ -292,7 +290,7 @@ where
 #[allow(missing_docs)]
 impl<'a, C, K> WalletOutputBatch<K> for Batch<'a, C, K>
 where
-	C: WalletClient,
+	C: NodeClient,
 	K: Keychain,
 {
 	fn keychain(&mut self) -> &mut K {
@@ -446,6 +444,8 @@ where
 		self.save(out.clone())
 	}
 
+	//TODO: Keys stored unencrypted in DB.. not good
+	// should store keys as derivation paths instead
 	fn save_private_context(&mut self, slate_id: &[u8], ctx: &Context) -> Result<(), Error> {
 		let ctx_key = to_key(PRIVATE_TX_CONTEXT_PREFIX, &mut slate_id.to_vec());
 		self.db.borrow().as_ref().unwrap().put_ser(&ctx_key, &ctx)?;

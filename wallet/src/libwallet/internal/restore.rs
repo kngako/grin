@@ -48,7 +48,7 @@ fn identify_utxo_outputs<T, C, K>(
 ) -> Result<Vec<OutputResult>, Error>
 where
 	T: WalletBackend<C, K>,
-	C: WalletClient,
+	C: NodeClient,
 	K: Keychain,
 {
 	let mut wallet_outputs: Vec<OutputResult> = Vec::new();
@@ -101,7 +101,7 @@ where
 pub fn restore<T, C, K>(wallet: &mut T) -> Result<(), Error>
 where
 	T: WalletBackend<C, K>,
-	C: WalletClient,
+	C: NodeClient,
 	K: Keychain,
 {
 	// Don't proceed if wallet_data has anything in it
@@ -118,7 +118,7 @@ where
 	let mut result_vec: Vec<OutputResult> = vec![];
 	loop {
 		let (highest_index, last_retrieved_index, outputs) = wallet
-			.client()
+			.w2n_client()
 			.get_outputs_by_pmmr_index(start_index, batch_size)?;
 		info!(
 			"Retrieved {} outputs, up to index {}. (Highest index: {})",

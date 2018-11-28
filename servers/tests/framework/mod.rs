@@ -30,7 +30,7 @@ use std::{fs, thread, time};
 use util::Mutex;
 
 use framework::keychain::Keychain;
-use wallet::{HTTPWalletClient, LMDBBackend, WalletConfig};
+use wallet::{HTTPNodeClient, HTTPWalletCommAdapter, LMDBBackend, WalletCommAdapter, WalletConfig};
 
 /// Just removes all results from previous runs
 pub fn clean_all_output(test_name_dir: &str) {
@@ -263,16 +263,16 @@ impl LocalServerContainer {
 		self.wallet_config.data_file_dir = self.working_dir.clone();
 
 		let _ = fs::create_dir_all(self.wallet_config.clone().data_file_dir);
-		let r = wallet::WalletSeed::init_file(&self.wallet_config);
+		let r = wallet::WalletSeed::init_file(&self.wallet_config, 32, "");
 
-		let client = HTTPWalletClient::new(&self.wallet_config.check_node_api_http_addr, None);
+		let client_n = HTTPNodeClient::new(&self.wallet_config.check_node_api_http_addr, None);
 
 		if let Err(_e) = r {
 			//panic!("Error initializing wallet seed: {}", e);
 		}
 
-		let wallet: LMDBBackend<HTTPWalletClient, keychain::ExtKeychain> =
-			LMDBBackend::new(self.wallet_config.clone(), "", client).unwrap_or_else(|e| {
+		let wallet: LMDBBackend<HTTPNodeClient, keychain::ExtKeychain> =
+			LMDBBackend::new(self.wallet_config.clone(), "", client_n).unwrap_or_else(|e| {
 				panic!(
 					"Error creating wallet: {:?} Config: {:?}",
 					e, self.wallet_config
@@ -280,7 +280,7 @@ impl LocalServerContainer {
 			});
 
 		wallet::controller::foreign_listener(
-			Box::new(wallet),
+			Arc::new(Mutex::new(wallet)),
 			&self.wallet_config.api_listen_addr(),
 			None,
 		).unwrap_or_else(|e| {
@@ -295,9 +295,9 @@ impl LocalServerContainer {
 
 	pub fn get_wallet_seed(config: &WalletConfig) -> wallet::WalletSeed {
 		let _ = fs::create_dir_all(config.clone().data_file_dir);
-		wallet::WalletSeed::init_file(config).unwrap();
+		wallet::WalletSeed::init_file(config, 32, "").unwrap();
 		let wallet_seed =
-			wallet::WalletSeed::from_file(config).expect("Failed to read wallet seed file.");
+			wallet::WalletSeed::from_file(config, "").expect("Failed to read wallet seed file.");
 		wallet_seed
 	}
 
@@ -306,15 +306,15 @@ impl LocalServerContainer {
 		wallet_seed: &wallet::WalletSeed,
 	) -> wallet::WalletInfo {
 		let keychain: keychain::ExtKeychain = wallet_seed
-			.derive_keychain("")
+			.derive_keychain()
 			.expect("Failed to derive keychain from seed file and passphrase.");
-		let client = HTTPWalletClient::new(&config.check_node_api_http_addr, None);
-		let mut wallet = LMDBBackend::new(config.clone(), "", client)
+		let client_n = HTTPNodeClient::new(&config.check_node_api_http_addr, None);
+		let mut wallet = LMDBBackend::new(config.clone(), "", client_n)
 			.unwrap_or_else(|e| panic!("Error creating wallet: {:?} Config: {:?}", e, config));
 		wallet.keychain = Some(keychain);
 		let parent_id = keychain::ExtKeychain::derive_key_id(2, 0, 0, 0, 0);
 		let _ = wallet::libwallet::internal::updater::refresh_outputs(&mut wallet, &parent_id);
-		wallet::libwallet::internal::updater::retrieve_info(&mut wallet, &parent_id).unwrap()
+		wallet::libwallet::internal::updater::retrieve_info(&mut wallet, &parent_id, 1).unwrap()
 	}
 
 	pub fn send_amount_to(
@@ -329,43 +329,41 @@ impl LocalServerContainer {
 			.expect("Could not parse amount as a number with optional decimal point.");
 
 		let wallet_seed =
-			wallet::WalletSeed::from_file(config).expect("Failed to read wallet seed file.");
+			wallet::WalletSeed::from_file(config, "").expect("Failed to read wallet seed file.");
 
 		let keychain: keychain::ExtKeychain = wallet_seed
-			.derive_keychain("")
+			.derive_keychain()
 			.expect("Failed to derive keychain from seed file and passphrase.");
 
-		let client = HTTPWalletClient::new(&config.check_node_api_http_addr, None);
+		let client_n = HTTPNodeClient::new(&config.check_node_api_http_addr, None);
+		let client_w = HTTPWalletCommAdapter::new();
 
 		let max_outputs = 500;
 		let change_outputs = 1;
 
-		let mut wallet = LMDBBackend::new(config.clone(), "", client)
+		let mut wallet = LMDBBackend::new(config.clone(), "", client_n)
 			.unwrap_or_else(|e| panic!("Error creating wallet: {:?} Config: {:?}", e, config));
 		wallet.keychain = Some(keychain);
-		let _ =
-			wallet::controller::owner_single_use(Arc::new(Mutex::new(Box::new(wallet))), |api| {
-				let result = api.issue_send_tx(
-					amount,
-					minimum_confirmations,
-					dest,
-					max_outputs,
-					change_outputs,
-					selection_strategy == "all",
-				);
-				match result {
-					Ok(_) => println!(
-						"Tx sent: {} grin to {} (strategy '{}')",
-						core::core::amount_to_hr_string(amount, false),
-						dest,
-						selection_strategy,
-					),
-					Err(e) => {
-						println!("Tx not sent to {}: {:?}", dest, e);
-					}
-				};
-				Ok(())
-			}).unwrap_or_else(|e| panic!("Error creating wallet: {:?} Config: {:?}", e, config));
+		let _ = wallet::controller::owner_single_use(Arc::new(Mutex::new(wallet)), |api| {
+			let (mut slate, lock_fn) = api.initiate_tx(
+				None,
+				amount,
+				minimum_confirmations,
+				max_outputs,
+				change_outputs,
+				selection_strategy == "all",
+			)?;
+			slate = client_w.send_tx_sync(dest, &slate)?;
+			api.finalize_tx(&mut slate)?;
+			api.tx_lock_outputs(&slate, lock_fn)?;
+			println!(
+				"Tx sent: {} grin to {} (strategy '{}')",
+				core::core::amount_to_hr_string(amount, false),
+				dest,
+				selection_strategy,
+			);
+			Ok(())
+		}).unwrap_or_else(|e| panic!("Error creating wallet: {:?} Config: {:?}", e, config));
 	}
 
 	/// Stops the running wallet server

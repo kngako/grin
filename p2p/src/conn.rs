@@ -1,4 +1,4 @@
-// Copyright 2018-2018 The Grin Developers
+// Copyright 2018 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,20 +22,26 @@
 
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::mem::size_of;
 use std::net::TcpStream;
 use std::sync::{mpsc, Arc};
 use std::{cmp, thread, time};
-use util::RwLock;
 
 use core::ser;
-use msg::{read_body, read_exact, read_header, write_all, write_to_buf, MsgHeader, Type};
+use core::ser::FixedLength;
+use msg::{read_body, read_header, read_item, write_to_buf, MsgHeader, Type};
 use types::Error;
+use util::read_write::{read_exact, write_all};
+use util::{RateCounter, RwLock};
 
 /// A trait to be implemented in order to receive messages from the
 /// connection. Allows providing an optional response.
 pub trait MessageHandler: Send + 'static {
-	fn consume<'a>(&self, msg: Message<'a>) -> Result<Option<Response<'a>>, Error>;
+	fn consume<'a>(
+		&self,
+		msg: Message<'a>,
+		writer: &'a mut Write,
+		received_bytes: Arc<RwLock<RateCounter>>,
+	) -> Result<Option<Response<'a>>, Error>;
 }
 
 // Macro to simplify the boilerplate around async I/O error handling,
@@ -57,25 +63,23 @@ macro_rules! try_break {
 /// header lazily consumes the message body, handling its deserialization.
 pub struct Message<'a> {
 	pub header: MsgHeader,
-	conn: &'a mut TcpStream,
+	stream: &'a mut Read,
 }
 
 impl<'a> Message<'a> {
-	fn from_header(header: MsgHeader, conn: &'a mut TcpStream) -> Message<'a> {
-		Message { header, conn }
-	}
-
-	/// Get the TcpStream
-	pub fn get_conn(&mut self) -> TcpStream {
-		return self.conn.try_clone().unwrap();
+	fn from_header(header: MsgHeader, stream: &'a mut Read) -> Message<'a> {
+		Message { header, stream }
 	}
 
 	/// Read the message body from the underlying connection
-	pub fn body<T>(&mut self) -> Result<T, Error>
-	where
-		T: ser::Readable,
-	{
-		read_body(&self.header, self.conn)
+	pub fn body<T: ser::Readable>(&mut self) -> Result<T, Error> {
+		read_body(&self.header, self.stream)
+	}
+
+	/// Read a single "thing" from the underlying connection.
+	/// Return the thing and the total bytes read.
+	pub fn streaming_read<T: ser::Readable>(&mut self) -> Result<(T, u64), Error> {
+		read_item(self.stream)
 	}
 
 	pub fn copy_attachment(&mut self, len: usize, writer: &mut Write) -> Result<usize, Error> {
@@ -84,7 +88,7 @@ impl<'a> Message<'a> {
 			let read_len = cmp::min(8000, len - written);
 			let mut buf = vec![0u8; read_len];
 			read_exact(
-				&mut self.conn,
+				&mut self.stream,
 				&mut buf[..],
 				time::Duration::from_secs(10),
 				true,
@@ -94,42 +98,49 @@ impl<'a> Message<'a> {
 		}
 		Ok(written)
 	}
-
-	/// Respond to the message with the provided message type and body
-	pub fn respond<T>(self, resp_type: Type, body: T) -> Response<'a>
-	where
-		T: ser::Writeable,
-	{
-		let body = ser::ser_vec(&body).unwrap();
-		Response {
-			resp_type: resp_type,
-			body: body,
-			conn: self.conn,
-			attachment: None,
-		}
-	}
 }
 
-/// Response to a `Message`
+/// Response to a `Message`.
 pub struct Response<'a> {
 	resp_type: Type,
 	body: Vec<u8>,
-	conn: &'a mut TcpStream,
+	stream: &'a mut Write,
 	attachment: Option<File>,
 }
 
 impl<'a> Response<'a> {
-	fn write(mut self) -> Result<(), Error> {
+	pub fn new<T: ser::Writeable>(resp_type: Type, body: T, stream: &'a mut Write) -> Response<'a> {
+		let body = ser::ser_vec(&body).unwrap();
+		Response {
+			resp_type,
+			body,
+			stream,
+			attachment: None,
+		}
+	}
+
+	fn write(mut self, sent_bytes: Arc<RwLock<RateCounter>>) -> Result<(), Error> {
 		let mut msg =
 			ser::ser_vec(&MsgHeader::new(self.resp_type, self.body.len() as u64)).unwrap();
 		msg.append(&mut self.body);
-		write_all(&mut self.conn, &msg[..], time::Duration::from_secs(10))?;
+		write_all(&mut self.stream, &msg[..], time::Duration::from_secs(10))?;
+		// Increase sent bytes counter
+		{
+			let mut sent_bytes = sent_bytes.write();
+			sent_bytes.inc(msg.len() as u64);
+		}
 		if let Some(mut file) = self.attachment {
 			let mut buf = [0u8; 8000];
 			loop {
 				match file.read(&mut buf[..]) {
 					Ok(0) => break,
-					Ok(n) => write_all(&mut self.conn, &buf[..n], time::Duration::from_secs(10))?,
+					Ok(n) => {
+						write_all(&mut self.stream, &buf[..n], time::Duration::from_secs(10))?;
+						// Increase sent bytes "quietly" without incrementing the counter.
+						// (In a loop here for the single attachment).
+						let mut sent_bytes = sent_bytes.write();
+						sent_bytes.inc_quiet(n as u64);
+					}
 					Err(e) => return Err(From::from(e)),
 				}
 			}
@@ -146,9 +157,9 @@ pub const SEND_CHANNEL_CAP: usize = 10;
 
 pub struct Tracker {
 	/// Bytes we've sent.
-	pub sent_bytes: Arc<RwLock<u64>>,
+	pub sent_bytes: Arc<RwLock<RateCounter>>,
 	/// Bytes we've received.
-	pub received_bytes: Arc<RwLock<u64>>,
+	pub received_bytes: Arc<RwLock<RateCounter>>,
 	/// Channel to allow sending data through the connection
 	pub send_channel: mpsc::SyncSender<Vec<u8>>,
 	/// Channel to close the connection
@@ -168,7 +179,7 @@ impl Tracker {
 
 		// Increase sent bytes counter
 		let mut sent_bytes = self.sent_bytes.write();
-		*sent_bytes += buf_len as u64;
+		sent_bytes.inc(buf_len as u64);
 
 		Ok(())
 	}
@@ -186,7 +197,9 @@ where
 	let (error_tx, error_rx) = mpsc::channel();
 
 	// Counter of number of bytes received
-	let received_bytes = Arc::new(RwLock::new(0));
+	let received_bytes = Arc::new(RwLock::new(RateCounter::new()));
+	// Counter of number of bytes sent
+	let sent_bytes = Arc::new(RwLock::new(RateCounter::new()));
 
 	stream
 		.set_nonblocking(true)
@@ -198,10 +211,11 @@ where
 		error_tx,
 		close_rx,
 		received_bytes.clone(),
+		sent_bytes.clone(),
 	);
 
 	Tracker {
-		sent_bytes: Arc::new(RwLock::new(0)),
+		sent_bytes: sent_bytes.clone(),
 		received_bytes: received_bytes.clone(),
 		send_channel: send_tx,
 		close_channel: close_tx,
@@ -215,22 +229,25 @@ fn poll<H>(
 	send_rx: mpsc::Receiver<Vec<u8>>,
 	error_tx: mpsc::Sender<Error>,
 	close_rx: mpsc::Receiver<()>,
-	received_bytes: Arc<RwLock<u64>>,
+	received_bytes: Arc<RwLock<RateCounter>>,
+	sent_bytes: Arc<RwLock<RateCounter>>,
 ) where
 	H: MessageHandler,
 {
-	let mut conn = conn;
+	// Split out tcp stream out into separate reader/writer halves.
+	let mut reader = conn.try_clone().expect("clone conn for reader failed");
+	let mut writer = conn.try_clone().expect("clone conn for writer failed");
+
 	let _ = thread::Builder::new()
 		.name("peer".to_string())
 		.spawn(move || {
 			let sleep_time = time::Duration::from_millis(1);
-
-			let conn = &mut conn;
 			let mut retry_send = Err(());
 			loop {
 				// check the read end
-				if let Some(h) = try_break!(error_tx, read_header(conn, None)) {
-					let msg = Message::from_header(h, conn);
+				if let Some(h) = try_break!(error_tx, read_header(&mut reader, None)) {
+					let msg = Message::from_header(h, &mut reader);
+
 					trace!(
 						"Received message header, type {:?}, len {}.",
 						msg.header.msg_type,
@@ -238,36 +255,28 @@ fn poll<H>(
 					);
 
 					// Increase received bytes counter
+					let received = received_bytes.clone();
 					{
 						let mut received_bytes = received_bytes.write();
-						let header_size = size_of::<MsgHeader>() as u64;
-						*received_bytes += header_size + msg.header.msg_len;
+						received_bytes.inc(MsgHeader::LEN as u64 + msg.header.msg_len);
 					}
 
-					if let Some(Some(resp)) = try_break!(error_tx, handler.consume(msg)) {
-						try_break!(error_tx, resp.write());
+					if let Some(Some(resp)) =
+						try_break!(error_tx, handler.consume(msg, &mut writer, received))
+					{
+						try_break!(error_tx, resp.write(sent_bytes.clone()));
 					}
 				}
 
-				// check the write end
-				if let Ok::<Vec<u8>, ()>(data) = retry_send {
-					if let None =
-						try_break!(error_tx, conn.write_all(&data[..]).map_err(&From::from))
-					{
+				// check the write end, use or_else so try_recv is lazily eval'd
+				let maybe_data = retry_send.or_else(|_| send_rx.try_recv());
+				retry_send = Err(());
+				if let Ok(data) = maybe_data {
+					let written =
+						try_break!(error_tx, writer.write_all(&data[..]).map_err(&From::from));
+					if written.is_none() {
 						retry_send = Ok(data);
-					} else {
-						retry_send = Err(());
 					}
-				} else if let Ok(data) = send_rx.try_recv() {
-					if let None =
-						try_break!(error_tx, conn.write_all(&data[..]).map_err(&From::from))
-					{
-						retry_send = Ok(data);
-					} else {
-						retry_send = Err(());
-					}
-				} else {
-					retry_send = Err(());
 				}
 
 				// check the close channel

@@ -56,14 +56,14 @@ fn accounts_test_impl(test_dir: &str) -> Result<(), libwallet::Error> {
 
 	// Create a new wallet test client, and set its queues to communicate with the
 	// proxy
-	let client = LocalWalletClient::new("wallet1", wallet_proxy.tx.clone());
-	let wallet1 = common::create_wallet(&format!("{}/wallet1", test_dir), client.clone());
-	wallet_proxy.add_wallet("wallet1", client.get_send_instance(), wallet1.clone());
+	let client1 = LocalWalletClient::new("wallet1", wallet_proxy.tx.clone());
+	let wallet1 = common::create_wallet(&format!("{}/wallet1", test_dir), client1.clone());
+	wallet_proxy.add_wallet("wallet1", client1.get_send_instance(), wallet1.clone());
 
+	let client2 = LocalWalletClient::new("wallet2", wallet_proxy.tx.clone());
 	// define recipient wallet, add to proxy
-	let wallet2 = common::create_wallet(&format!("{}/wallet2", test_dir), client.clone());
-	let client = LocalWalletClient::new("wallet2", wallet_proxy.tx.clone());
-	wallet_proxy.add_wallet("wallet2", client.get_send_instance(), wallet2.clone());
+	let wallet2 = common::create_wallet(&format!("{}/wallet2", test_dir), client2.clone());
+	wallet_proxy.add_wallet("wallet2", client2.get_send_instance(), wallet2.clone());
 
 	// Set the wallet proxy listener running
 	thread::spawn(move || {
@@ -128,13 +128,13 @@ fn accounts_test_impl(test_dir: &str) -> Result<(), libwallet::Error> {
 
 	// Should have 5 in account1 (5 spendable), 5 in account (2 spendable)
 	wallet::controller::owner_single_use(wallet1.clone(), |api| {
-		let (wallet1_refreshed, wallet1_info) = api.retrieve_summary_info(true)?;
+		let (wallet1_refreshed, wallet1_info) = api.retrieve_summary_info(true, 1)?;
 		assert!(wallet1_refreshed);
 		assert_eq!(wallet1_info.last_confirmed_height, 12);
 		assert_eq!(wallet1_info.total, 5 * reward);
 		assert_eq!(wallet1_info.amount_currently_spendable, (5 - cm) * reward);
 		// check tx log as well
-		let (_, txs) = api.retrieve_txs(true, None)?;
+		let (_, txs) = api.retrieve_txs(true, None, None)?;
 		assert_eq!(txs.len(), 5);
 		Ok(())
 	})?;
@@ -145,15 +145,15 @@ fn accounts_test_impl(test_dir: &str) -> Result<(), libwallet::Error> {
 	}
 	wallet::controller::owner_single_use(wallet1.clone(), |api| {
 		// check last confirmed height on this account is different from above (should be 0)
-		let (_, wallet1_info) = api.retrieve_summary_info(false)?;
+		let (_, wallet1_info) = api.retrieve_summary_info(false, 1)?;
 		assert_eq!(wallet1_info.last_confirmed_height, 0);
-		let (wallet1_refreshed, wallet1_info) = api.retrieve_summary_info(true)?;
+		let (wallet1_refreshed, wallet1_info) = api.retrieve_summary_info(true, 1)?;
 		assert!(wallet1_refreshed);
 		assert_eq!(wallet1_info.last_confirmed_height, 12);
 		assert_eq!(wallet1_info.total, 7 * reward);
 		assert_eq!(wallet1_info.amount_currently_spendable, 7 * reward);
 		// check tx log as well
-		let (_, txs) = api.retrieve_txs(true, None)?;
+		let (_, txs) = api.retrieve_txs(true, None, None)?;
 		assert_eq!(txs.len(), 7);
 		Ok(())
 	})?;
@@ -164,15 +164,15 @@ fn accounts_test_impl(test_dir: &str) -> Result<(), libwallet::Error> {
 		w.set_parent_key_id_by_name("default")?;
 	}
 	wallet::controller::owner_single_use(wallet1.clone(), |api| {
-		let (_, wallet1_info) = api.retrieve_summary_info(false)?;
+		let (_, wallet1_info) = api.retrieve_summary_info(false, 1)?;
 		assert_eq!(wallet1_info.last_confirmed_height, 0);
-		let (wallet1_refreshed, wallet1_info) = api.retrieve_summary_info(true)?;
+		let (wallet1_refreshed, wallet1_info) = api.retrieve_summary_info(true, 1)?;
 		assert!(wallet1_refreshed);
 		assert_eq!(wallet1_info.last_confirmed_height, 12);
 		assert_eq!(wallet1_info.total, 0,);
 		assert_eq!(wallet1_info.amount_currently_spendable, 0,);
 		// check tx log as well
-		let (_, txs) = api.retrieve_txs(true, None)?;
+		let (_, txs) = api.retrieve_txs(true, None, None)?;
 		assert_eq!(txs.len(), 0);
 		Ok(())
 	})?;
@@ -184,23 +184,25 @@ fn accounts_test_impl(test_dir: &str) -> Result<(), libwallet::Error> {
 	}
 
 	wallet::controller::owner_single_use(wallet1.clone(), |api| {
-		let slate = api.issue_send_tx(
-			reward,    // amount
-			2,         // minimum confirmations
-			"wallet2", // dest
-			500,       // max outputs
-			1,         // num change outputs
-			true,      // select all outputs
+		let (mut slate, lock_fn) = api.initiate_tx(
+			None, reward, // amount
+			2,      // minimum confirmations
+			500,    // max outputs
+			1,      // num change outputs
+			true,   // select all outputs
 		)?;
+		slate = client1.send_tx_slate_direct("wallet2", &slate)?;
+		api.tx_lock_outputs(&slate, lock_fn)?;
+		api.finalize_tx(&mut slate)?;
 		api.post_tx(&slate, false)?;
 		Ok(())
 	})?;
 
 	wallet::controller::owner_single_use(wallet1.clone(), |api| {
-		let (wallet1_refreshed, wallet1_info) = api.retrieve_summary_info(true)?;
+		let (wallet1_refreshed, wallet1_info) = api.retrieve_summary_info(true, 1)?;
 		assert!(wallet1_refreshed);
 		assert_eq!(wallet1_info.last_confirmed_height, 13);
-		let (_, txs) = api.retrieve_txs(true, None)?;
+		let (_, txs) = api.retrieve_txs(true, None, None)?;
 		assert_eq!(txs.len(), 9);
 		Ok(())
 	})?;
@@ -211,11 +213,11 @@ fn accounts_test_impl(test_dir: &str) -> Result<(), libwallet::Error> {
 		w.set_parent_key_id_by_name("account2")?;
 	}
 	wallet::controller::owner_single_use(wallet1.clone(), |api| {
-		let (_, wallet1_info) = api.retrieve_summary_info(false)?;
+		let (_, wallet1_info) = api.retrieve_summary_info(false, 1)?;
 		assert_eq!(wallet1_info.last_confirmed_height, 12);
-		let (_, wallet1_info) = api.retrieve_summary_info(true)?;
+		let (_, wallet1_info) = api.retrieve_summary_info(true, 1)?;
 		assert_eq!(wallet1_info.last_confirmed_height, 13);
-		let (_, txs) = api.retrieve_txs(true, None)?;
+		let (_, txs) = api.retrieve_txs(true, None, None)?;
 		println!("{:?}", txs);
 		assert_eq!(txs.len(), 5);
 		Ok(())
@@ -223,10 +225,10 @@ fn accounts_test_impl(test_dir: &str) -> Result<(), libwallet::Error> {
 
 	// wallet 2 should only have this tx on the listener account
 	wallet::controller::owner_single_use(wallet2.clone(), |api| {
-		let (wallet2_refreshed, wallet2_info) = api.retrieve_summary_info(true)?;
+		let (wallet2_refreshed, wallet2_info) = api.retrieve_summary_info(true, 1)?;
 		assert!(wallet2_refreshed);
 		assert_eq!(wallet2_info.last_confirmed_height, 13);
-		let (_, txs) = api.retrieve_txs(true, None)?;
+		let (_, txs) = api.retrieve_txs(true, None, None)?;
 		assert_eq!(txs.len(), 1);
 		Ok(())
 	})?;
@@ -236,15 +238,15 @@ fn accounts_test_impl(test_dir: &str) -> Result<(), libwallet::Error> {
 		w.set_parent_key_id_by_name("default")?;
 	}
 	wallet::controller::owner_single_use(wallet2.clone(), |api| {
-		let (_, wallet2_info) = api.retrieve_summary_info(false)?;
+		let (_, wallet2_info) = api.retrieve_summary_info(false, 1)?;
 		assert_eq!(wallet2_info.last_confirmed_height, 0);
-		let (wallet2_refreshed, wallet2_info) = api.retrieve_summary_info(true)?;
+		let (wallet2_refreshed, wallet2_info) = api.retrieve_summary_info(true, 1)?;
 		assert!(wallet2_refreshed);
 		assert_eq!(wallet2_info.last_confirmed_height, 13);
 		assert_eq!(wallet2_info.total, 0,);
 		assert_eq!(wallet2_info.amount_currently_spendable, 0,);
 		// check tx log as well
-		let (_, txs) = api.retrieve_txs(true, None)?;
+		let (_, txs) = api.retrieve_txs(true, None, None)?;
 		assert_eq!(txs.len(), 0);
 		Ok(())
 	})?;

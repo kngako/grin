@@ -28,10 +28,10 @@ use util::Mutex;
 use chain::Chain;
 use core::core::{OutputFeatures, OutputIdentifier, Transaction};
 use core::{consensus, global, pow, ser};
-use wallet::libwallet;
-use wallet::libwallet::types::{BlockFees, CbData, WalletClient, WalletInst};
+use wallet::libwallet::types::{BlockFees, CbData, NodeClient, WalletInst};
 use wallet::lmdb_wallet::LMDBBackend;
-use wallet::WalletConfig;
+use wallet::{controller, libwallet};
+use wallet::{WalletBackend, WalletConfig};
 
 use util;
 use util::secp::pedersen;
@@ -116,10 +116,10 @@ pub fn add_block_with_reward(chain: &Chain, txs: Vec<&Transaction>, reward: CbDa
 pub fn award_block_to_wallet<C, K>(
 	chain: &Chain,
 	txs: Vec<&Transaction>,
-	wallet: Arc<Mutex<Box<WalletInst<C, K>>>>,
+	wallet: Arc<Mutex<WalletInst<C, K>>>,
 ) -> Result<(), libwallet::Error>
 where
-	C: WalletClient,
+	C: NodeClient,
 	K: keychain::Keychain,
 {
 	// build block fees
@@ -131,7 +131,7 @@ where
 		height: prev.height + 1,
 	};
 	// build coinbase (via api) and add block
-	libwallet::controller::foreign_single_use(wallet.clone(), |api| {
+	controller::foreign_single_use(wallet.clone(), |api| {
 		let coinbase_tx = api.build_coinbase(&block_fees)?;
 		add_block_with_reward(chain, txs, coinbase_tx.clone());
 		Ok(())
@@ -142,11 +142,11 @@ where
 /// Award a blocks to a wallet directly
 pub fn award_blocks_to_wallet<C, K>(
 	chain: &Chain,
-	wallet: Arc<Mutex<Box<WalletInst<C, K>>>>,
+	wallet: Arc<Mutex<WalletInst<C, K>>>,
 	number: usize,
 ) -> Result<(), libwallet::Error>
 where
-	C: WalletClient,
+	C: NodeClient,
 	K: keychain::Keychain,
 {
 	for _ in 0..number {
@@ -156,21 +156,16 @@ where
 }
 
 /// dispatch a db wallet
-pub fn create_wallet<C, K>(dir: &str, client: C) -> Arc<Mutex<Box<WalletInst<C, K>>>>
+pub fn create_wallet<C, K>(dir: &str, n_client: C) -> Arc<Mutex<WalletInst<C, K>>>
 where
-	C: WalletClient + 'static,
+	C: NodeClient + 'static,
 	K: keychain::Keychain + 'static,
 {
 	let mut wallet_config = WalletConfig::default();
 	wallet_config.data_file_dir = String::from(dir);
-	let _ = wallet::WalletSeed::init_file(&wallet_config);
-	let mut wallet: Box<WalletInst<C, K>> = {
-		let mut wallet: LMDBBackend<C, K> = LMDBBackend::new(wallet_config.clone(), "", client)
-			.unwrap_or_else(|e| {
-				panic!("Error creating wallet: {:?} Config: {:?}", e, wallet_config)
-			});
-		Box::new(wallet)
-	};
+	let _ = wallet::WalletSeed::init_file(&wallet_config, 32, "");
+	let mut wallet = LMDBBackend::new(wallet_config.clone(), "", n_client)
+		.unwrap_or_else(|e| panic!("Error creating wallet: {:?} Config: {:?}", e, wallet_config));
 	wallet.open_with_credentials().unwrap_or_else(|e| {
 		panic!(
 			"Error initializing wallet: {:?} Config: {:?}",

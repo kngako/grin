@@ -18,10 +18,11 @@
 //! Still experimental, not sure this is the best way to do this
 
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use util::Mutex;
+use uuid::Uuid;
 
 use serde_json as json;
 
@@ -30,10 +31,10 @@ use core::core::Transaction;
 use core::ser;
 use keychain::{Identifier, Keychain};
 use libtx::slate::Slate;
-use libwallet::internal::{keys, selection, tx, updater};
+use libwallet::internal::{keys, tx, updater};
 use libwallet::types::{
-	AcctPathMapping, BlockFees, CbData, OutputData, TxLogEntry, TxWrapper, WalletBackend,
-	WalletClient, WalletInfo,
+	AcctPathMapping, BlockFees, CbData, NodeClient, OutputData, TxLogEntry, TxWrapper,
+	WalletBackend, WalletInfo,
 };
 use libwallet::{Error, ErrorKind};
 use util;
@@ -44,12 +45,12 @@ use util::secp::pedersen;
 pub struct APIOwner<W: ?Sized, C, K>
 where
 	W: WalletBackend<C, K>,
-	C: WalletClient,
+	C: NodeClient,
 	K: Keychain,
 {
 	/// Wallet, contains its keychain (TODO: Split these up into 2 traits
 	/// perhaps)
-	pub wallet: Arc<Mutex<Box<W>>>,
+	pub wallet: Arc<Mutex<W>>,
 	phantom: PhantomData<K>,
 	phantom_c: PhantomData<C>,
 }
@@ -57,11 +58,11 @@ where
 impl<W: ?Sized, C, K> APIOwner<W, C, K>
 where
 	W: WalletBackend<C, K>,
-	C: WalletClient,
+	C: NodeClient,
 	K: Keychain,
 {
 	/// Create new API instance
-	pub fn new(wallet_in: Arc<Mutex<Box<W>>>) -> Self {
+	pub fn new(wallet_in: Arc<Mutex<W>>) -> Self {
 		APIOwner {
 			wallet: wallet_in,
 			phantom: PhantomData,
@@ -89,7 +90,7 @@ where
 
 		let res = Ok((
 			validated,
-			updater::retrieve_outputs(&mut **w, include_spent, tx_id, &parent_key_id)?,
+			updater::retrieve_outputs(&mut *w, include_spent, tx_id, &parent_key_id)?,
 		));
 
 		w.close()?;
@@ -102,6 +103,7 @@ where
 		&self,
 		refresh_from_node: bool,
 		tx_id: Option<u32>,
+		tx_slate_id: Option<Uuid>,
 	) -> Result<(bool, Vec<TxLogEntry>), Error> {
 		let mut w = self.wallet.lock();
 		w.open_with_credentials()?;
@@ -114,7 +116,7 @@ where
 
 		let res = Ok((
 			validated,
-			updater::retrieve_txs(&mut **w, tx_id, &parent_key_id)?,
+			updater::retrieve_txs(&mut *w, tx_id, tx_slate_id, &parent_key_id)?,
 		));
 
 		w.close()?;
@@ -125,6 +127,7 @@ where
 	pub fn retrieve_summary_info(
 		&mut self,
 		refresh_from_node: bool,
+		minimum_confirmations: u64,
 	) -> Result<(bool, WalletInfo), Error> {
 		let mut w = self.wallet.lock();
 		w.open_with_credentials()?;
@@ -135,7 +138,7 @@ where
 			validated = self.update_outputs(&mut w);
 		}
 
-		let wallet_info = updater::retrieve_info(&mut **w, &parent_key_id)?;
+		let wallet_info = updater::retrieve_info(&mut *w, &parent_key_id, minimum_confirmations)?;
 		let res = Ok((validated, wallet_info));
 
 		w.close()?;
@@ -145,108 +148,72 @@ where
 	/// Return list of existing account -> Path mappings
 	pub fn accounts(&mut self) -> Result<Vec<AcctPathMapping>, Error> {
 		let mut w = self.wallet.lock();
-		keys::accounts(&mut **w)
+		keys::accounts(&mut *w)
 	}
 
 	/// Create a new account path
 	pub fn new_account_path(&mut self, label: &str) -> Result<Identifier, Error> {
 		let mut w = self.wallet.lock();
-		keys::new_acct_path(&mut **w, label)
+		keys::new_acct_path(&mut *w, label)
 	}
 
-	/// Issues a send transaction and sends to recipient
-	pub fn issue_send_tx(
+	/// Creates a new partial transaction for the given amount
+	pub fn initiate_tx(
 		&mut self,
+		src_acct_name: Option<&str>,
 		amount: u64,
 		minimum_confirmations: u64,
-		dest: &str,
 		max_outputs: usize,
 		num_change_outputs: usize,
 		selection_strategy_is_use_all: bool,
-	) -> Result<Slate, Error> {
+	) -> Result<(Slate, impl FnOnce(&mut W, &str) -> Result<(), Error>), Error> {
 		let mut w = self.wallet.lock();
 		w.open_with_credentials()?;
-		let parent_key_id = w.parent_key_id();
-
-		let client;
-		let mut slate_out: Slate;
-		let lock_fn_out;
-
-		client = w.client().clone();
-		let (slate, context, lock_fn) = tx::create_send_tx(
-			&mut **w,
-			amount,
-			minimum_confirmations,
-			max_outputs,
-			num_change_outputs,
-			selection_strategy_is_use_all,
-			&parent_key_id,
-		)?;
-
-		lock_fn_out = lock_fn;
-		slate_out = match client.send_tx_slate(dest, &slate) {
-			Ok(s) => s,
-			Err(e) => {
-				error!(
-				"Communication with receiver failed on SenderInitiation send. Aborting transaction {:?}",
-				e,
-			);
-				return Err(e)?;
+		let parent_key_id = match src_acct_name {
+			Some(d) => {
+				let pm = w.get_acct_path(d.to_owned())?;
+				match pm {
+					Some(p) => p.path,
+					None => w.parent_key_id(),
+				}
 			}
+			None => w.parent_key_id(),
 		};
 
-		tx::complete_tx(&mut **w, &mut slate_out, &context)?;
-		let tx_hex = util::to_hex(ser::ser_vec(&slate_out.tx).unwrap());
-
-		// lock our inputs
-		lock_fn_out(&mut **w, &tx_hex)?;
-		w.close()?;
-		Ok(slate_out)
-	}
-
-	/// Write a transaction to send to file so a user can transmit it to the
-	/// receiver in whichever way they see fit (aka carrier pigeon mode).
-	pub fn send_tx(
-		&mut self,
-		write_to_disk: bool,
-		amount: u64,
-		minimum_confirmations: u64,
-		dest: &str,
-		max_outputs: usize,
-		num_change_outputs: usize,
-		selection_strategy_is_use_all: bool,
-	) -> Result<Slate, Error> {
-		let mut w = self.wallet.lock();
-		w.open_with_credentials()?;
-		let parent_key_id = w.parent_key_id();
-
 		let (slate, context, lock_fn) = tx::create_send_tx(
-			&mut **w,
+			&mut *w,
 			amount,
 			minimum_confirmations,
 			max_outputs,
 			num_change_outputs,
 			selection_strategy_is_use_all,
 			&parent_key_id,
+			false,
 		)?;
-		if write_to_disk {
-			let mut pub_tx = File::create(dest)?;
-			pub_tx.write_all(json::to_string(&slate).unwrap().as_bytes())?;
-			pub_tx.sync_all()?;
-		}
 
+		// Save the aggsig context in our DB for when we
+		// recieve the transaction back
 		{
 			let mut batch = w.batch()?;
 			batch.save_private_context(slate.id.as_bytes(), &context)?;
 			batch.commit()?;
 		}
 
-		let tx_hex = util::to_hex(ser::ser_vec(&slate.tx).unwrap());
-
-		// lock our inputs
-		lock_fn(&mut **w, &tx_hex)?;
 		w.close()?;
-		Ok(slate)
+		Ok((slate, lock_fn))
+	}
+
+	/// Lock outputs associated with a given slate/transaction
+	pub fn tx_lock_outputs(
+		&mut self,
+		slate: &Slate,
+		lock_fn: impl FnOnce(&mut W, &str) -> Result<(), Error>,
+	) -> Result<(), Error> {
+		let mut w = self.wallet.lock();
+		w.open_with_credentials()?;
+		let tx_hex = util::to_hex(ser::ser_vec(&slate.tx).unwrap());
+		lock_fn(&mut *w, &tx_hex)?;
+		Ok(())
 	}
 
 	/// Sender finalization of the transaction. Takes the file returned by the
@@ -255,10 +222,11 @@ where
 	/// propagation.
 	pub fn finalize_tx(&mut self, slate: &mut Slate) -> Result<(), Error> {
 		let mut w = self.wallet.lock();
+		let parent_key_id = w.parent_key_id();
 		w.open_with_credentials()?;
-
 		let context = w.get_private_context(slate.id.as_bytes())?;
-		tx::complete_tx(&mut **w, slate, &context)?;
+		tx::complete_tx(&mut *w, slate, &context)?;
+		tx::update_tx_hex(&mut *w, &parent_key_id, slate)?;
 		{
 			let mut batch = w.batch()?;
 			batch.delete_private_context(slate.id.as_bytes())?;
@@ -274,7 +242,11 @@ where
 	/// output if you're recipient), and unlock all locked outputs associated
 	/// with the transaction used when a transaction is created but never
 	/// posted
-	pub fn cancel_tx(&mut self, tx_id: u32) -> Result<(), Error> {
+	pub fn cancel_tx(
+		&mut self,
+		tx_id: Option<u32>,
+		tx_slate_id: Option<Uuid>,
+	) -> Result<(), Error> {
 		let mut w = self.wallet.lock();
 		w.open_with_credentials()?;
 		let parent_key_id = w.parent_key_id();
@@ -283,7 +255,7 @@ where
 				"Can't contact running Grin node. Not Cancelling.",
 			))?;
 		}
-		tx::cancel_tx(&mut **w, &parent_key_id, tx_id)?;
+		tx::cancel_tx(&mut *w, &parent_key_id, tx_id, tx_slate_id)?;
 		w.close()?;
 		Ok(())
 	}
@@ -299,14 +271,15 @@ where
 		w.open_with_credentials()?;
 		let parent_key_id = w.parent_key_id();
 		let tx_burn = tx::issue_burn_tx(
-			&mut **w,
+			&mut *w,
 			amount,
 			minimum_confirmations,
 			max_outputs,
 			&parent_key_id,
 		)?;
 		let tx_hex = util::to_hex(ser::ser_vec(&tx_burn).unwrap());
-		w.client().post_tx(&TxWrapper { tx_hex: tx_hex }, false)?;
+		w.w2n_client()
+			.post_tx(&TxWrapper { tx_hex: tx_hex }, false)?;
 		w.close()?;
 		Ok(())
 	}
@@ -316,7 +289,7 @@ where
 		let tx_hex = util::to_hex(ser::ser_vec(&slate.tx).unwrap());
 		let client = {
 			let mut w = self.wallet.lock();
-			w.client().clone()
+			w.w2n_client().clone()
 		};
 		let res = client.post_tx(&TxWrapper { tx_hex: tx_hex }, fluff);
 		if let Err(e) = res {
@@ -343,7 +316,7 @@ where
 			let mut w = self.wallet.lock();
 			w.open_with_credentials()?;
 			let parent_key_id = w.parent_key_id();
-			let res = tx::retrieve_tx_hex(&mut **w, &parent_key_id, tx_id)?;
+			let res = tx::retrieve_tx_hex(&mut *w, &parent_key_id, tx_id)?;
 			w.close()?;
 			res
 		};
@@ -377,8 +350,8 @@ where
 			let mut w = self.wallet.lock();
 			w.open_with_credentials()?;
 			let parent_key_id = w.parent_key_id();
-			client = w.client().clone();
-			let res = tx::retrieve_tx_hex(&mut **w, &parent_key_id, tx_id)?;
+			client = w.w2n_client().clone();
+			let res = tx::retrieve_tx_hex(&mut *w, &parent_key_id, tx_id)?;
 			w.close()?;
 			res
 		};
@@ -396,23 +369,13 @@ where
 			);
 			return Err(ErrorKind::TransactionBuildingNotCompleted(tx_id))?;
 		}
-
-		let res = client.post_tx(
+		client.post_tx(
 			&TxWrapper {
 				tx_hex: tx_hex.unwrap(),
 			},
 			fluff,
-		);
-		if let Err(e) = res {
-			error!("api: repost_tx: failed with error: {}", e);
-			Err(e)
-		} else {
-			debug!(
-				"api: repost_tx: successfully posted tx at: {}, fluff? {}",
-				tx_id, fluff
-			);
-			Ok(())
-		}
+		)?;
+		Ok(())
 	}
 
 	/// Attempt to restore contents of wallet
@@ -429,7 +392,7 @@ where
 		let res = {
 			let mut w = self.wallet.lock();
 			w.open_with_credentials()?;
-			w.client().get_chain_height()
+			w.w2n_client().get_chain_height()
 		};
 		match res {
 			Ok(height) => Ok((height, true)),
@@ -459,12 +422,12 @@ where
 pub struct APIForeign<W: ?Sized, C, K>
 where
 	W: WalletBackend<C, K>,
-	C: WalletClient,
+	C: NodeClient,
 	K: Keychain,
 {
 	/// Wallet, contains its keychain (TODO: Split these up into 2 traits
 	/// perhaps)
-	pub wallet: Arc<Mutex<Box<W>>>,
+	pub wallet: Arc<Mutex<W>>,
 	phantom: PhantomData<K>,
 	phantom_c: PhantomData<C>,
 }
@@ -472,11 +435,11 @@ where
 impl<'a, W: ?Sized, C, K> APIForeign<W, C, K>
 where
 	W: WalletBackend<C, K>,
-	C: WalletClient,
+	C: NodeClient,
 	K: Keychain,
 {
 	/// Create new API instance
-	pub fn new(wallet_in: Arc<Mutex<Box<W>>>) -> Box<Self> {
+	pub fn new(wallet_in: Arc<Mutex<W>>) -> Box<Self> {
 		Box::new(APIForeign {
 			wallet: wallet_in,
 			phantom: PhantomData,
@@ -488,54 +451,30 @@ where
 	pub fn build_coinbase(&mut self, block_fees: &BlockFees) -> Result<CbData, Error> {
 		let mut w = self.wallet.lock();
 		w.open_with_credentials()?;
-		let res = updater::build_coinbase(&mut **w, block_fees);
+		let res = updater::build_coinbase(&mut *w, block_fees);
 		w.close()?;
 		res
 	}
 
-	/// A sender provided a transaction file with appropriate public keys and
-	/// metadata. Complete the receivers' end of it to generate another file
-	/// to send back.
-	pub fn file_receive_tx(&mut self, source: &str) -> Result<(), Error> {
-		let mut pub_tx_f = File::open(source)?;
-		let mut content = String::new();
-		pub_tx_f.read_to_string(&mut content)?;
-		let mut slate: Slate = json::from_str(&content).map_err(|_| ErrorKind::Format)?;
-
-		let mut wallet = self.wallet.lock();
-		wallet.open_with_credentials()?;
-		let parent_key_id = wallet.parent_key_id();
-
-		// create an output using the amount in the slate
-		let (_, mut context, receiver_create_fn) =
-			selection::build_recipient_output_with_slate(&mut **wallet, &mut slate, parent_key_id)?;
-
-		// fill public keys
-		let _ = slate.fill_round_1(
-			wallet.keychain(),
-			&mut context.sec_key,
-			&context.sec_nonce,
-			1,
-		)?;
-
-		// perform partial sig
-		let _ = slate.fill_round_2(wallet.keychain(), &context.sec_key, &context.sec_nonce, 1)?;
-
-		// save to file
-		let mut pub_tx = File::create(source.to_owned() + ".response")?;
-		pub_tx.write_all(json::to_string(&slate).unwrap().as_bytes())?;
-
-		// Save output in wallet
-		let _ = receiver_create_fn(&mut wallet);
-		Ok(())
-	}
-
 	/// Receive a transaction from a sender
-	pub fn receive_tx(&mut self, slate: &mut Slate) -> Result<(), Error> {
+	pub fn receive_tx(
+		&mut self,
+		slate: &mut Slate,
+		dest_acct_name: Option<&str>,
+	) -> Result<(), Error> {
 		let mut w = self.wallet.lock();
 		w.open_with_credentials()?;
-		let parent_key_id = w.parent_key_id();
-		let res = tx::receive_tx(&mut **w, slate, &parent_key_id);
+		let parent_key_id = match dest_acct_name {
+			Some(d) => {
+				let pm = w.get_acct_path(d.to_owned())?;
+				match pm {
+					Some(p) => p.path,
+					None => w.parent_key_id(),
+				}
+			}
+			None => w.parent_key_id(),
+		};
+		let res = tx::receive_tx(&mut *w, slate, &parent_key_id, false);
 		w.close()?;
 
 		if let Err(e) = res {

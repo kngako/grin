@@ -15,7 +15,9 @@
 //! Controller for wallet.. instantiates and handles listeners (or single-run
 //! invocations) as needed.
 //! Still experimental
+use adapters::{FileWalletCommAdapter, HTTPWalletCommAdapter};
 use api::{ApiServer, BasicAuthMiddleware, Handler, ResponseFuture, Router, TLSConfig};
+use core::core;
 use core::core::Transaction;
 use failure::ResultExt;
 use futures::future::{err, ok};
@@ -25,7 +27,7 @@ use keychain::Keychain;
 use libtx::slate::Slate;
 use libwallet::api::{APIForeign, APIOwner};
 use libwallet::types::{
-	CbData, OutputData, SendTXArgs, TxLogEntry, WalletBackend, WalletClient, WalletInfo,
+	CbData, NodeClient, OutputData, SendTXArgs, TxLogEntry, WalletBackend, WalletInfo,
 };
 use libwallet::{Error, ErrorKind};
 use serde::{Deserialize, Serialize};
@@ -41,11 +43,11 @@ use util::Mutex;
 
 /// Instantiate wallet Owner API for a single-use (command line) call
 /// Return a function containing a loaded API context to call
-pub fn owner_single_use<F, T: ?Sized, C, K>(wallet: Arc<Mutex<Box<T>>>, f: F) -> Result<(), Error>
+pub fn owner_single_use<F, T: ?Sized, C, K>(wallet: Arc<Mutex<T>>, f: F) -> Result<(), Error>
 where
 	T: WalletBackend<C, K>,
 	F: FnOnce(&mut APIOwner<T, C, K>) -> Result<(), Error>,
-	C: WalletClient,
+	C: NodeClient,
 	K: Keychain,
 {
 	f(&mut APIOwner::new(wallet.clone()))?;
@@ -54,11 +56,11 @@ where
 
 /// Instantiate wallet Foreign API for a single-use (command line) call
 /// Return a function containing a loaded API context to call
-pub fn foreign_single_use<F, T: ?Sized, C, K>(wallet: Arc<Mutex<Box<T>>>, f: F) -> Result<(), Error>
+pub fn foreign_single_use<F, T: ?Sized, C, K>(wallet: Arc<Mutex<T>>, f: F) -> Result<(), Error>
 where
 	T: WalletBackend<C, K>,
 	F: FnOnce(&mut APIForeign<T, C, K>) -> Result<(), Error>,
-	C: WalletClient,
+	C: NodeClient,
 	K: Keychain,
 {
 	f(&mut APIForeign::new(wallet.clone()))?;
@@ -68,7 +70,7 @@ where
 /// Listener version, providing same API but listening for requests on a
 /// port and wrapping the calls
 pub fn owner_listener<T: ?Sized, C, K>(
-	wallet: Box<T>,
+	wallet: Arc<Mutex<T>>,
 	addr: &str,
 	api_secret: Option<String>,
 	tls_config: Option<TLSConfig>,
@@ -76,11 +78,10 @@ pub fn owner_listener<T: ?Sized, C, K>(
 where
 	T: WalletBackend<C, K> + Send + Sync + 'static,
 	OwnerAPIHandler<T, C, K>: Handler,
-	C: WalletClient + 'static,
+	C: NodeClient + 'static,
 	K: Keychain + 'static,
 {
-	let wallet_arc = Arc::new(Mutex::new(wallet));
-	let api_handler = OwnerAPIHandler::new(wallet_arc);
+	let api_handler = OwnerAPIHandler::new(wallet);
 
 	let mut router = Router::new();
 	if api_secret.is_some() {
@@ -110,16 +111,16 @@ where
 /// Listener version, providing same API but listening for requests on a
 /// port and wrapping the calls
 pub fn foreign_listener<T: ?Sized, C, K>(
-	wallet: Box<T>,
+	wallet: Arc<Mutex<T>>,
 	addr: &str,
 	tls_config: Option<TLSConfig>,
 ) -> Result<(), Error>
 where
 	T: WalletBackend<C, K> + Send + Sync + 'static,
-	C: WalletClient + 'static,
+	C: NodeClient + 'static,
 	K: Keychain + 'static,
 {
-	let api_handler = ForeignAPIHandler::new(Arc::new(Mutex::new(wallet)));
+	let api_handler = ForeignAPIHandler::new(wallet);
 
 	let mut router = Router::new();
 	router
@@ -146,11 +147,11 @@ type WalletResponseFuture = Box<Future<Item = Response<Body>, Error = Error> + S
 pub struct OwnerAPIHandler<T: ?Sized, C, K>
 where
 	T: WalletBackend<C, K> + Send + Sync + 'static,
-	C: WalletClient + 'static,
+	C: NodeClient + 'static,
 	K: Keychain + 'static,
 {
 	/// Wallet instance
-	pub wallet: Arc<Mutex<Box<T>>>,
+	pub wallet: Arc<Mutex<T>>,
 	phantom: PhantomData<K>,
 	phantom_c: PhantomData<C>,
 }
@@ -158,11 +159,11 @@ where
 impl<T: ?Sized, C, K> OwnerAPIHandler<T, C, K>
 where
 	T: WalletBackend<C, K> + Send + Sync + 'static,
-	C: WalletClient + 'static,
+	C: NodeClient + 'static,
 	K: Keychain + 'static,
 {
 	/// Create a new owner API handler for GET methods
-	pub fn new(wallet: Arc<Mutex<Box<T>>>) -> OwnerAPIHandler<T, C, K> {
+	pub fn new(wallet: Arc<Mutex<T>>) -> OwnerAPIHandler<T, C, K> {
 		OwnerAPIHandler {
 			wallet,
 			phantom: PhantomData,
@@ -187,8 +188,8 @@ where
 			show_spent = true;
 		}
 		if let Some(ids) = params.get("tx_id") {
-			for i in ids {
-				id = Some(i.parse().unwrap());
+			if let Some(x) = ids.first() {
+				id = Some(x.parse().unwrap());
 			}
 		}
 		api.retrieve_outputs(show_spent, update_from_node, id)
@@ -199,7 +200,8 @@ where
 		req: &Request<Body>,
 		api: APIOwner<T, C, K>,
 	) -> Result<(bool, Vec<TxLogEntry>), Error> {
-		let mut id = None;
+		let mut tx_id = None;
+		let mut tx_slate_id = None;
 		let mut update_from_node = false;
 
 		let params = parse_params(req);
@@ -208,11 +210,16 @@ where
 			update_from_node = true;
 		}
 		if let Some(ids) = params.get("id") {
-			for i in ids {
-				id = Some(i.parse().unwrap());
+			if let Some(x) = ids.first() {
+				tx_id = Some(x.parse().unwrap());
 			}
 		}
-		api.retrieve_txs(update_from_node, id)
+		if let Some(tx_slate_ids) = params.get("tx_id") {
+			if let Some(x) = tx_slate_ids.first() {
+				tx_slate_id = Some(x.parse().unwrap());
+			}
+		}
+		api.retrieve_txs(update_from_node, tx_id, tx_slate_id)
 	}
 
 	fn dump_stored_tx(
@@ -249,8 +256,17 @@ where
 		req: &Request<Body>,
 		mut api: APIOwner<T, C, K>,
 	) -> Result<(bool, WalletInfo), Error> {
-		let update_from_node = param_exists(req, "refresh");
-		api.retrieve_summary_info(update_from_node)
+		let mut minimum_confirmations = 1; // TODO - default needed here
+		let params = parse_params(req);
+		let update_from_node = params.get("refresh").is_some();
+
+		if let Some(confs) = params.get("minimum_confirmations") {
+			if let Some(x) = confs.first() {
+				minimum_confirmations = x.parse().unwrap();
+			}
+		}
+
+		api.retrieve_summary_info(update_from_node, minimum_confirmations)
 	}
 
 	fn node_height(
@@ -287,29 +303,53 @@ where
 		mut api: APIOwner<T, C, K>,
 	) -> Box<Future<Item = Slate, Error = Error> + Send> {
 		Box::new(parse_body(req).and_then(move |args: SendTXArgs| {
+			let result = api.initiate_tx(
+				None,
+				args.amount,
+				args.minimum_confirmations,
+				args.max_outputs,
+				args.num_change_outputs,
+				args.selection_strategy_is_use_all,
+			);
+			let (mut slate, lock_fn) = match result {
+				Ok(s) => {
+					info!(
+						"Tx created: {} grin to {} (strategy '{}')",
+						core::amount_to_hr_string(args.amount, false),
+						&args.dest,
+						args.selection_strategy_is_use_all,
+					);
+					s
+				}
+				Err(e) => {
+					error!("Tx not created: {}", e);
+					match e.kind() {
+						// user errors, don't backtrace
+						ErrorKind::NotEnoughFunds { .. } => {}
+						ErrorKind::FeeDispute { .. } => {}
+						ErrorKind::FeeExceedsAmount { .. } => {}
+						_ => {
+							// otherwise give full dump
+							error!("Backtrace: {}", e.backtrace().unwrap());
+						}
+					};
+					return Err(e);
+				}
+			};
 			if args.method == "http" {
-				api.issue_send_tx(
-					args.amount,
-					args.minimum_confirmations,
-					&args.dest,
-					args.max_outputs,
-					args.num_change_outputs,
-					args.selection_strategy_is_use_all,
-				)
+				let adapter = HTTPWalletCommAdapter::new();
+				slate = adapter.send_tx_sync(&args.dest, &slate)?;
+				api.tx_lock_outputs(&slate, lock_fn)?;
+				api.finalize_tx(&mut slate)?;
 			} else if args.method == "file" {
-				api.send_tx(
-					false,
-					args.amount,
-					args.minimum_confirmations,
-					&args.dest,
-					args.max_outputs,
-					args.num_change_outputs,
-					args.selection_strategy_is_use_all,
-				)
+				let adapter = FileWalletCommAdapter::new();
+				adapter.send_tx_async(&args.dest, &slate)?;
+				api.tx_lock_outputs(&slate, lock_fn)?;
 			} else {
 				error!("unsupported payment method: {}", args.method);
 				return Err(ErrorKind::ClientCallback("unsupported payment method"))?;
 			}
+			Ok(slate)
 		}))
 	}
 
@@ -337,7 +377,7 @@ where
 		let params = parse_params(&req);
 		if let Some(id_string) = params.get("id") {
 			Box::new(match id_string[0].parse() {
-				Ok(id) => match api.cancel_tx(id) {
+				Ok(id) => match api.cancel_tx(Some(id), None) {
 					Ok(_) => ok(()),
 					Err(e) => {
 						error!("cancel_tx: failed with error: {}", e);
@@ -351,9 +391,25 @@ where
 					).into())
 				}
 			})
+		} else if let Some(tx_id_string) = params.get("tx_id") {
+			Box::new(match tx_id_string[0].parse() {
+				Ok(tx_id) => match api.cancel_tx(None, Some(tx_id)) {
+					Ok(_) => ok(()),
+					Err(e) => {
+						error!("cancel_tx: failed with error: {}", e);
+						err(e)
+					}
+				},
+				Err(e) => {
+					error!("cancel_tx: could not parse tx_id: {}", e);
+					err(ErrorKind::TransactionCancellationError(
+						"cancel_tx: cannot cancel transaction. Could not parse tx_id in request.",
+					).into())
+				}
+			})
 		} else {
 			Box::new(err(ErrorKind::TransactionCancellationError(
-				"cancel_tx: Cannot cancel transaction. Missing id param in request.",
+				"cancel_tx: Cannot cancel transaction. Missing id or tx_id param in request.",
 			).into()))
 		}
 	}
@@ -436,7 +492,7 @@ where
 impl<T: ?Sized, C, K> Handler for OwnerAPIHandler<T, C, K>
 where
 	T: WalletBackend<C, K> + Send + Sync + 'static,
-	C: WalletClient + 'static,
+	C: NodeClient + 'static,
 	K: Keychain + 'static,
 {
 	fn get(&self, req: Request<Body>) -> ResponseFuture {
@@ -470,11 +526,11 @@ where
 pub struct ForeignAPIHandler<T: ?Sized, C, K>
 where
 	T: WalletBackend<C, K> + Send + Sync + 'static,
-	C: WalletClient + 'static,
+	C: NodeClient + 'static,
 	K: Keychain + 'static,
 {
 	/// Wallet instance
-	pub wallet: Arc<Mutex<Box<T>>>,
+	pub wallet: Arc<Mutex<T>>,
 	phantom: PhantomData<K>,
 	phantom_c: PhantomData<C>,
 }
@@ -482,11 +538,11 @@ where
 impl<T: ?Sized, C, K> ForeignAPIHandler<T, C, K>
 where
 	T: WalletBackend<C, K> + Send + Sync + 'static,
-	C: WalletClient + 'static,
+	C: NodeClient + 'static,
 	K: Keychain + 'static,
 {
 	/// create a new api handler
-	pub fn new(wallet: Arc<Mutex<Box<T>>>) -> ForeignAPIHandler<T, C, K> {
+	pub fn new(wallet: Arc<Mutex<T>>) -> ForeignAPIHandler<T, C, K> {
 		ForeignAPIHandler {
 			wallet,
 			phantom: PhantomData,
@@ -507,15 +563,15 @@ where
 		req: Request<Body>,
 		mut api: APIForeign<T, C, K>,
 	) -> Box<Future<Item = Slate, Error = Error> + Send> {
-		Box::new(
-			parse_body(req).and_then(move |mut slate| match api.receive_tx(&mut slate) {
+		Box::new(parse_body(req).and_then(
+			move |mut slate| match api.receive_tx(&mut slate, None) {
 				Ok(_) => ok(slate.clone()),
 				Err(e) => {
 					error!("receive_tx: failed with error: {}", e);
 					err(e)
 				}
-			}),
-		)
+			},
+		))
 	}
 
 	fn handle_request(&self, req: Request<Body>) -> WalletResponseFuture {
@@ -543,7 +599,7 @@ where
 impl<T: ?Sized, C, K> Handler for ForeignAPIHandler<T, C, K>
 where
 	T: WalletBackend<C, K> + Send + Sync + 'static,
-	C: WalletClient + Send + Sync + 'static,
+	C: NodeClient + Send + Sync + 'static,
 	K: Keychain + 'static,
 {
 	fn post(&self, req: Request<Body>) -> ResponseFuture {
@@ -612,10 +668,6 @@ fn parse_params(req: &Request<Body>) -> HashMap<String, Vec<String>> {
 			}),
 		None => HashMap::new(),
 	}
-}
-
-fn param_exists(req: &Request<Body>, param: &str) -> bool {
-	parse_params(req).get(param).is_some()
 }
 
 fn parse_body<T>(req: Request<Body>) -> Box<Future<Item = T, Error = Error> + Send>
